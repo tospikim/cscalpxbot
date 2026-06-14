@@ -21,14 +21,16 @@ console.log('🔍 Chat ID:', JSON.stringify(TG_CHAT_ID), '| uzunluk:', TG_CHAT_I
 
 // Ayarlar
 const CONFIG = {
-  minConfidence:   75,        // Min sinyal güveni (%)
-  minVolume:       50000000,  // Min günlük hacim ($50M)
-  scanTopN:        15,        // Kaç coin taranacak
-  scanInterval:    120000,    // Tarama sıklığı (ms) = 2 dakika
+  minConfidence:   70,        // Min sinyal güveni (%) - 75'ten 70'e düşürüldü
+  minVolume:       50000000,  // (eski - kullanılmıyor)
+  scanMaxDetailed: 80,        // Hacim filtresinden sonra kaç coin detaylı taranacak
+  minScanVolume:   15000000,  // Tarama için min 24s hacim ($15M)
+  scanInterval:    300000,    // Tarama sıklığı (ms) = 5 dakika
   dedupeMinutes:   30,        // Aynı coin için tekrar uyarı engeli (dk)
   scalpTF:         '5m',      // Scalp zaman dilimi
   requireBacktest: true,      // Backtest kârlı olmalı mı
-  minWinRate:      50,        // Min backtest kazanma oranı (%)
+  minWinRate:      45,        // Min backtest kazanma oranı (%) - 50'den 45'e
+  minBacktestTrades: 2,       // Min backtest işlem sayısı - 3'ten 2'ye
 };
 
 const alarmHistory = {};
@@ -161,30 +163,33 @@ function calcScalpSignal(bars, price) {
   const signals = { long: [], short: [] };
 
   if (mom) {
-    if (mom.roc > 0 && mom.rising) { longSig += 20; signals.long.push('Momentum yukarı + hızlanıyor'); }
-    if (mom.roc < 0 && !mom.rising) { shortSig += 20; signals.short.push('Momentum aşağı + hızlanıyor'); }
+    if (mom.roc > 0 && mom.rising) { longSig += 26; signals.long.push('Momentum yukarı + hızlanıyor'); }
+    else if (mom.roc > 0) { longSig += 14; signals.long.push('Momentum yukarı'); }
+    if (mom.roc < 0 && !mom.rising) { shortSig += 26; signals.short.push('Momentum aşağı + hızlanıyor'); }
+    else if (mom.roc < 0) { shortSig += 14; signals.short.push('Momentum aşağı'); }
   }
   if (flow) {
-    if (flow.delta > 10) { longSig += 25; signals.long.push(`Güçlü alım baskısı (%${flow.buyPct.toFixed(0)})`); }
-    else if (flow.delta > 3) { longSig += 12; signals.long.push('Alım baskısı'); }
-    if (flow.delta < -10) { shortSig += 25; signals.short.push(`Güçlü satım baskısı (%${flow.sellPct.toFixed(0)})`); }
-    else if (flow.delta < -3) { shortSig += 12; signals.short.push('Satım baskısı'); }
+    if (flow.delta > 10) { longSig += 30; signals.long.push(`Güçlü alım baskısı (%${flow.buyPct.toFixed(0)})`); }
+    else if (flow.delta > 3) { longSig += 16; signals.long.push('Alım baskısı'); }
+    if (flow.delta < -10) { shortSig += 30; signals.short.push(`Güçlü satım baskısı (%${flow.sellPct.toFixed(0)})`); }
+    else if (flow.delta < -3) { shortSig += 16; signals.short.push('Satım baskısı'); }
   }
   if (ribbon) {
-    if (ribbon.trend === 'GUCLU YUKSELIS') { longSig += 22; signals.long.push('EMA ribbon boğa dizilimi'); }
-    else if (ribbon.trend === 'YUKSELIS') { longSig += 10; signals.long.push('EMA yukarı'); }
-    if (ribbon.trend === 'GUCLU DUSUS') { shortSig += 22; signals.short.push('EMA ribbon ayı dizilimi'); }
-    else if (ribbon.trend === 'DUSUS') { shortSig += 10; signals.short.push('EMA aşağı'); }
+    if (ribbon.trend === 'GUCLU YUKSELIS') { longSig += 28; signals.long.push('EMA ribbon boğa dizilimi'); }
+    else if (ribbon.trend === 'YUKSELIS') { longSig += 14; signals.long.push('EMA yukarı'); }
+    if (ribbon.trend === 'GUCLU DUSUS') { shortSig += 28; signals.short.push('EMA ribbon ayı dizilimi'); }
+    else if (ribbon.trend === 'DUSUS') { shortSig += 14; signals.short.push('EMA aşağı'); }
   }
   if (rsiNow !== null) {
-    if (rsiNow > 40 && rsiNow < 65) { longSig += 8; signals.long.push('RSI sağlıklı (40-65)'); }
-    if (rsiNow < 60 && rsiNow > 35) { shortSig += 8; signals.short.push('RSI sağlıklı (35-60)'); }
-    if (rsiNow < 30) { longSig += 15; signals.long.push('RSI aşırı satım dönüş'); }
-    if (rsiNow > 70) { shortSig += 15; signals.short.push('RSI aşırı alım dönüş'); }
+    if (rsiNow > 40 && rsiNow < 65) { longSig += 10; signals.long.push('RSI sağlıklı (40-65)'); }
+    if (rsiNow < 60 && rsiNow > 35) { shortSig += 10; signals.short.push('RSI sağlıklı (35-60)'); }
+    if (rsiNow < 30) { longSig += 18; signals.long.push('RSI aşırı satım dönüş'); }
+    if (rsiNow > 70) { shortSig += 18; signals.short.push('RSI aşırı alım dönüş'); }
   }
 
   const dir = longSig >= shortSig ? 'LONG' : 'SHORT';
-  const confidence = Math.min(100, Math.round(Math.max(longSig, shortSig) / 90 * 100));
+  // Gerçekçi maksimum ~74 puan (mom 26 + flow 30 + ribbon 28 - örtüşme). 74'e normalize.
+  const confidence = Math.min(100, Math.round(Math.max(longSig, shortSig) / 74 * 100));
   return {
     dir, confidence,
     signals: dir === 'LONG' ? signals.long : signals.short,
@@ -200,7 +205,7 @@ function backtestScalp(bars, tfId) {
   for (let i = 30; i < bars.length - 10; i++) {
     const window = bars.slice(0, i + 1);
     const sig = calcScalpSignal(window, bars[i].c);
-    if (!sig || sig.confidence < 65) continue;
+    if (!sig || sig.confidence < 60) continue;
     const entry = bars[i].c;
     const atr = sig.atr || entry * 0.005;
     const slDist = Math.min(atr * 0.8, entry * slPctMax);
@@ -440,25 +445,34 @@ async function fetchOKX(sym, tf) {
 }
 
 // Top coins by volume from CoinGecko
+// OKX'teki TÜM coinlerin 24s hacim + değişim verisini tek istekte çek
 async function fetchHotCoins() {
-  const url = 'https://api.coingecko.com/api/v3/coins/markets' +
-    '?vs_currency=usd&order=volume_desc&per_page=50&page=1' +
-    '&sparkline=false&price_change_percentage=1h,24h';
   try {
-    const r = await fetch(url);
-    const data = await r.json();
-    return data
-      .filter(c => c.total_volume > CONFIG.minVolume)
-      .map(c => ({
-        sym: c.symbol.toUpperCase(),
-        price: c.current_price,
-        chg24: c.price_change_percentage_24h || 0,
-        vol: c.total_volume,
-        scalpScore: Math.abs(c.price_change_percentage_1h_in_currency || 0) * 2 +
-                    (c.total_volume / 1e9) * 0.5,
-      }));
+    const r = await fetch('https://www.okx.com/api/v5/market/tickers?instType=SWAP');
+    if (!r.ok) { console.error('OKX tickers HTTP', r.status); return []; }
+    const d = await r.json();
+    if (d.code !== '0' || !d.data) return [];
+
+    return d.data
+      .filter(t => t.instId.endsWith('-USDT-SWAP'))
+      .map(t => {
+        const last = parseFloat(t.last) || 0;
+        const open24 = parseFloat(t.open24h) || last;
+        const vol24Usd = parseFloat(t.volCcy24h) * last || 0; // hacmi USD'ye çevir
+        const chg24 = open24 > 0 ? ((last - open24) / open24 * 100) : 0;
+        return {
+          sym: t.instId.replace('-USDT-SWAP', ''),
+          instId: t.instId,
+          price: last,
+          chg24,
+          vol: vol24Usd,
+          // Scalp skoru: hareket + hacim
+          scalpScore: Math.abs(chg24) * 1.5 + (vol24Usd / 1e9) * 0.5,
+        };
+      })
+      .filter(c => c.vol > CONFIG.minScanVolume && c.price > 0);
   } catch (e) {
-    console.error('Hot coins fetch error:', e.message);
+    console.error('OKX hot coins error:', e.message);
     return [];
   }
 }
@@ -473,29 +487,41 @@ async function scanForSignals() {
     return;
   }
 
+  // Hacim + hareket olan coinleri scalp skoruna göre sırala, en iyi N tanesini detaylı tara
   const candidates = coins
     .sort((a, b) => b.scalpScore - a.scalpScore)
-    .slice(0, CONFIG.scanTopN);
+    .slice(0, CONFIG.scanMaxDetailed);
 
+  console.log(new Date().toLocaleTimeString('tr-TR'), `- ${coins.length} coin hacim filtresinden geçti, ${candidates.length} tanesi detaylı taranıyor...`);
   let found = 0;
+  // Teşhis sayaçları - neden sinyal verilmediğini görmek için
+  let noData = 0, lowConf = 0, deduped = 0, btFail = 0, scanned = 0;
+  let bestSeen = { sym: null, conf: 0 };
+
   for (const coin of candidates) {
     try {
       const bars = await fetchOHLC(coin.sym, CONFIG.scalpTF);
-      if (!bars || bars.length < 30) continue;
+      if (!bars || bars.length < 30) { noData++; continue; }
+      scanned++;
 
       const sig = calcScalpSignal(bars, coin.price);
-      if (!sig || sig.confidence < CONFIG.minConfidence) continue;
+      if (!sig) { noData++; continue; }
+
+      // En yüksek güveni takip et (teşhis için)
+      if (sig.confidence > bestSeen.conf) bestSeen = { sym: coin.sym, conf: sig.confidence, dir: sig.dir };
+
+      if (sig.confidence < CONFIG.minConfidence) { lowConf++; continue; }
 
       // Dedupe
       const key = coin.sym + sig.dir;
       const now = Date.now();
-      if (alarmHistory[key] && now - alarmHistory[key] < CONFIG.dedupeMinutes * 60000) continue;
+      if (alarmHistory[key] && now - alarmHistory[key] < CONFIG.dedupeMinutes * 60000) { deduped++; continue; }
 
       // Backtest filter
       const bt = backtestScalp(bars, CONFIG.scalpTF);
       if (CONFIG.requireBacktest && bt) {
-        if (!bt.profitable || parseFloat(bt.winRate) < CONFIG.minWinRate || bt.total < 3) {
-          continue;
+        if (!bt.profitable || parseFloat(bt.winRate) < CONFIG.minWinRate || bt.total < CONFIG.minBacktestTrades) {
+          btFail++; continue;
         }
       }
 
@@ -548,7 +574,13 @@ ${sig.signals.slice(0, 4).map(s => '• ' + s).join('\n')}${btNote}
     }
   }
 
-  console.log(new Date().toLocaleTimeString('tr-TR'), `- Tarama bitti. ${candidates.length} coin tarandı, ${found} sinyal bulundu.`);
+  // Detaylı teşhis logu
+  console.log(new Date().toLocaleTimeString('tr-TR'),
+    `- ✅ Tarama bitti | Tarandı: ${scanned} | Sinyal: ${found} | ` +
+    `Düşük güven: ${lowConf} | Backtest eledi: ${btFail} | Tekrar engeli: ${deduped} | Veri yok: ${noData}`);
+  if (found === 0 && bestSeen.sym) {
+    console.log(`   ℹ️ En yüksek güven: ${bestSeen.sym} ${bestSeen.dir||''} %${bestSeen.conf} (eşik %${CONFIG.minConfidence}). Uygun fırsat bulunamadı, bu normal.`);
+  }
 }
 
 // ================================================================
@@ -913,12 +945,13 @@ async function pollCommands() {
 // ================================================================
 async function start() {
   console.log('🤖 CryptoPro Telegram Bot başlatılıyor...');
-  console.log(`Ayarlar: Min güven %${CONFIG.minConfidence}, ${CONFIG.scalpTF} TF, ${CONFIG.scanInterval / 1000}s tarama`);
+  console.log(`Ayarlar: Min güven %${CONFIG.minConfidence}, ${CONFIG.scalpTF} TF, ${CONFIG.scanInterval / 60000}dk tarama, max ${CONFIG.scanMaxDetailed} coin`);
 
   // Test Telegram connection
   const ok = await sendTelegram(
     '🤖 <b>CryptoPro Bot Aktif!</b>\n\n' +
-    `📡 Her ${CONFIG.scanInterval / 60000} dakikada bir top ${CONFIG.scanTopN} coin taranıyor.\n` +
+    `📡 Her ${CONFIG.scanInterval / 60000} dakikada (5dk mum kapanışı) tüm coinler taranıyor.\n` +
+    `🔍 Hacim >$${(CONFIG.minScanVolume/1e6).toFixed(0)}M olan coinlerden en hareketli ${CONFIG.scanMaxDetailed} tanesi analiz ediliyor.\n` +
     `🎯 Min güven: %${CONFIG.minConfidence}\n` +
     `⏱️ Scalp TF: ${CONFIG.scalpTF}\n` +
     `📊 Backtest filtresi: ${CONFIG.requireBacktest ? 'Açık (min %' + CONFIG.minWinRate + ')' : 'Kapalı'}\n\n` +
