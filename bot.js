@@ -4,13 +4,20 @@
 // Dashboard'daki aynı analiz motorunu kullanır
 // ================================================================
 
-// Tırnak, boşluk ve fazladan karakterleri temizle (Railway bazen tırnak ekler)
+// Tırnak, boşluk, gizli karakterleri agresif temizle (Railway tırnak ekleyebilir)
 function clean(v) {
   if (!v) return '';
-  return String(v).trim().replace(/^["']+|["']+$/g, '').trim();
+  return String(v)
+    .replace(/[\r\n\t]/g, '')        // satır sonu, tab
+    .replace(/^[\s"']+|[\s"']+$/g, '') // baştaki/sondaki boşluk ve tırnaklar
+    .trim();
 }
 const TG_TOKEN   = clean(process.env.TG_TOKEN)   || 'BURAYA_BOT_TOKEN';
 const TG_CHAT_ID = clean(process.env.TG_CHAT_ID) || 'BURAYA_CHAT_ID';
+
+// DEBUG: Railway'in gerçekte ne aktardığını gör (token'ın sadece güvenli kısmı)
+console.log('🔍 Token uzunluğu:', TG_TOKEN.length, '| İlk 12:', TG_TOKEN.slice(0, 12), '| Son 4:', TG_TOKEN.slice(-4));
+console.log('🔍 Chat ID:', JSON.stringify(TG_CHAT_ID), '| uzunluk:', TG_CHAT_ID.length);
 
 // Ayarlar
 const CONFIG = {
