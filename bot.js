@@ -1,3 +1,5 @@
+const crypto = require('crypto');
+
 // ================================================================
 // CryptoPro Telegram Scalp Signal Bot
 // 7/24 çalışır, yüksek güvenli scalp sinyallerini Telegram'a gönderir
@@ -14,6 +16,31 @@ function clean(v) {
 }
 const TG_TOKEN   = clean(process.env.TG_TOKEN)   || 'BURAYA_BOT_TOKEN';
 const TG_CHAT_ID = clean(process.env.TG_CHAT_ID) || 'BURAYA_CHAT_ID';
+
+// ── OKX İŞLEM API (gerçek para) ──
+const OKX_API_KEY    = clean(process.env.OKX_API_KEY)    || '';
+const OKX_SECRET     = clean(process.env.OKX_SECRET)     || '';
+const OKX_PASSPHRASE = clean(process.env.OKX_PASSPHRASE) || '';
+
+// İŞLEM AYARLARI
+const TRADE = {
+  // GÜVENLİK: Gerçek işlem için bunu Railway'de LIVE_TRADING=true yap.
+  // false ise bot sadece sinyal verir, GERÇEK İŞLEM AÇMAZ.
+  live: clean(process.env.LIVE_TRADING) === 'true',
+  riskPerTrade: 2,          // her işlemde bakiyenin %2'si risk
+  dailyLossLimit: 10,       // günlük -%10 zararda bot durur
+  maxOpenPositions: 0,      // 0 = limitsiz
+  tdMode: 'isolated',       // izole marjin (cross değil - daha güvenli)
+};
+
+// İşlem durumu takibi
+let tradingState = {
+  enabled: true,            // /islemdur ile kapatılabilir
+  dayStartBalance: null,    // günün başındaki bakiye
+  dayStartTime: Date.now(),
+  realizedPnlToday: 0,
+  haltedReason: null,       // zarar limiti aşılırsa sebep
+};
 
 // DEBUG: Railway'in gerçekte ne aktardığını gör (token'ın sadece güvenli kısmı)
 console.log('🔍 Token uzunluğu:', TG_TOKEN.length, '| İlk 12:', TG_TOKEN.slice(0, 12), '| Son 4:', TG_TOKEN.slice(-4));
@@ -451,6 +478,154 @@ function backtestScalp(bars, tfId) {
 // SEMBOL KAYDI - tüm borsalardaki coinleri başlangıçta yükle
 // Kullanıcı "PEPE" yazınca borsadaki gerçek sembolü ("1000PEPEUSDT") bulur
 // ================================================================
+// ================================================================
+// OKX İŞLEM API (imzalı istekler - gerçek para)
+// ================================================================
+const OKX_BASE = 'https://www.okx.com';
+
+// OKX V5 imzalı istek
+async function okxRequest(method, path, body) {
+  const timestamp = new Date().toISOString();
+  const bodyStr = body ? JSON.stringify(body) : '';
+  const prehash = timestamp + method + path + bodyStr;
+  const sign = crypto.createHmac('sha256', OKX_SECRET).update(prehash).digest('base64');
+
+  const headers = {
+    'OK-ACCESS-KEY': OKX_API_KEY,
+    'OK-ACCESS-SIGN': sign,
+    'OK-ACCESS-TIMESTAMP': timestamp,
+    'OK-ACCESS-PASSPHRASE': OKX_PASSPHRASE,
+    'Content-Type': 'application/json',
+  };
+
+  try {
+    const r = await fetch(OKX_BASE + path, {
+      method,
+      headers,
+      body: bodyStr || undefined,
+    });
+    const d = await r.json();
+    return d;
+  } catch (e) {
+    console.error('OKX API hatası:', e.message);
+    return { code: 'error', msg: e.message };
+  }
+}
+
+// Hesap bakiyesi (USDT)
+async function getOKXBalance() {
+  const d = await okxRequest('GET', '/api/v5/account/balance?ccy=USDT');
+  if (d.code !== '0' || !d.data?.[0]?.details?.[0]) return null;
+  return parseFloat(d.data[0].details[0].availBal || d.data[0].details[0].cashBal || 0);
+}
+
+// Kaldıraç ayarla
+async function setOKXLeverage(instId, leverage, mgnMode) {
+  const d = await okxRequest('POST', '/api/v5/account/set-leverage', {
+    instId, lever: String(leverage), mgnMode: mgnMode || 'isolated',
+  });
+  return d.code === '0';
+}
+
+// Enstrüman bilgisi (lot size, min size) - cache'li
+const instrumentCache = {};
+async function getInstrumentInfo(instId) {
+  if (instrumentCache[instId]) return instrumentCache[instId];
+  const d = await okxRequest('GET', `/api/v5/public/instruments?instType=SWAP&instId=${instId}`);
+  if (d.code !== '0' || !d.data?.[0]) return null;
+  const info = {
+    lotSz: parseFloat(d.data[0].lotSz),
+    minSz: parseFloat(d.data[0].minSz),
+    ctVal: parseFloat(d.data[0].ctVal),
+    tickSz: parseFloat(d.data[0].tickSz),
+  };
+  instrumentCache[instId] = info;
+  return info;
+}
+
+// Fiyatı tick size'a yuvarla
+function roundToTick(price, tickSz) {
+  const decimals = (tickSz.toString().split('.')[1] || '').length;
+  return parseFloat((Math.round(price / tickSz) * tickSz).toFixed(decimals));
+}
+
+// LİMİT EMİR + TP/SL aç
+async function openOKXPosition(sym, dir, entry, sl, tp, leverage, balance) {
+  const instId = SYMBOL_REGISTRY.okx[sym.toUpperCase()] || (sym.toUpperCase() + '-USDT-SWAP');
+
+  // Enstrüman bilgisi
+  const info = await getInstrumentInfo(instId);
+  if (!info) return { ok: false, msg: 'Enstrüman bilgisi alınamadı' };
+
+  // Kaldıracı ayarla
+  await setOKXLeverage(instId, leverage, TRADE.tdMode);
+
+  // Pozisyon büyüklüğü: risk = bakiye * %2, SL mesafesine göre kontrat sayısı
+  const slDistPct = Math.abs(entry - sl) / entry;
+  const riskUsd = balance * (TRADE.riskPerTrade / 100);
+  // Pozisyon değeri = risk / SL mesafesi (kaldıraçsız nominal)
+  const posValueUsd = riskUsd / slDistPct;
+  // Kontrat sayısı = pozisyon değeri / (giriş fiyatı * ctVal)
+  let contracts = posValueUsd / (entry * info.ctVal);
+  // Lot size'a yuvarla
+  contracts = Math.floor(contracts / info.lotSz) * info.lotSz;
+  if (contracts < info.minSz) contracts = info.minSz;
+
+  const px = roundToTick(entry, info.tickSz);
+  const slPx = roundToTick(sl, info.tickSz);
+  const tpPx = roundToTick(tp, info.tickSz);
+  const side = dir === 'LONG' ? 'buy' : 'sell';
+  const posSide = dir === 'LONG' ? 'long' : 'short';
+
+  // Limit emir + bağlı TP/SL (attachAlgoOrds)
+  const order = {
+    instId,
+    tdMode: TRADE.tdMode,
+    side,
+    posSide,
+    ordType: 'limit',
+    px: String(px),
+    sz: String(contracts),
+    attachAlgoOrds: [{
+      attachAlgoClOrdId: 'tp' + Date.now(),
+      tpTriggerPx: String(tpPx),
+      tpOrdPx: '-1',          // -1 = market (TP tetiklenince market sat)
+      slTriggerPx: String(slPx),
+      slOrdPx: '-1',          // -1 = market (SL tetiklenince market sat)
+    }],
+  };
+
+  const d = await okxRequest('POST', '/api/v5/trade/order', order);
+  if (d.code === '0' && d.data?.[0]?.sCode === '0') {
+    return { ok: true, ordId: d.data[0].ordId, contracts, instId, px };
+  }
+  const errMsg = d.data?.[0]?.sMsg || d.msg || 'Bilinmeyen hata';
+  return { ok: false, msg: errMsg };
+}
+
+// Günlük zarar limiti kontrolü
+async function checkDailyLossLimit() {
+  // Gün değiştiyse sıfırla
+  if (Date.now() - tradingState.dayStartTime > 24*60*60*1000) {
+    tradingState.dayStartBalance = await getOKXBalance();
+    tradingState.dayStartTime = Date.now();
+    tradingState.realizedPnlToday = 0;
+    tradingState.haltedReason = null;
+  }
+  if (!tradingState.dayStartBalance) {
+    tradingState.dayStartBalance = await getOKXBalance();
+    return true; // ilk kez, devam
+  }
+  const cur = await getOKXBalance();
+  if (cur === null) return true;
+  const lossPct = (tradingState.dayStartBalance - cur) / tradingState.dayStartBalance * 100;
+  if (lossPct >= TRADE.dailyLossLimit) {
+    tradingState.haltedReason = `Günlük zarar limiti aşıldı (-%${lossPct.toFixed(1)})`;
+    return false;
+  }
+  return true;
+}
+
 const SYMBOL_REGISTRY = {
   binance: {},  // { PEPE: "1000PEPEUSDT", BTC: "BTCUSDT", ... }
   bybit:   {},
@@ -707,6 +882,36 @@ async function monitorPositions() {
 
       let closePos = false;
 
+      // ── GİRİŞ KONTROLÜ: limit emir doldu mu (fiyat giriş bölgesine geldi mi) ──
+      if (!pos.filled) {
+        let justFilled = false;
+        if (pos.dir === 'LONG') {
+          // LONG: fiyat giriş bölgesine indi mi (limit alım dolar)
+          if (low <= pos.entryZoneHigh) justFilled = true;
+        } else {
+          // SHORT: fiyat giriş bölgesine çıktı mı (limit satım dolar)
+          if (high >= pos.entryZoneLow) justFilled = true;
+        }
+        if (justFilled) {
+          pos.filled = true;
+          await sendTelegram(
+            `✅ <b>GİRİŞ YAPILDI — ${sym} ${pos.dir}</b>\n\n` +
+            `📍 Giriş: $${f(pos.entry)}\n` +
+            `🛑 SL: $${f(pos.sl)}\n` +
+            `🎯 TP1: $${f(pos.tp1)} · TP2: $${f(pos.tp2)} · TP3: $${f(pos.tp3)}\n` +
+            `⚡ Kaldıraç: ${pos.leverage}x\n\n` +
+            `Pozisyon açık, takip ediliyor.`
+          );
+        } else {
+          // Henüz giriş yok → TP/SL kontrolü YAPMA, sadece zaman aşımı kontrol et
+          if (Date.now() - pos.openTime > 24*60*60*1000) {
+            delete openPositions[sym];
+            console.log(`${sym} giriş bölgesine 24s gelmedi, sinyal iptal edildi`);
+          }
+          continue; // giriş olmadan TP/SL bildirimi verme
+        }
+      }
+
       if (pos.dir === 'LONG') {
         // SL kontrolü (fiyat SL'in altına indi mi)
         if (low <= pos.sl) {
@@ -756,12 +961,6 @@ async function monitorPositions() {
             await sendTelegram(`🎯 <b>TP1 GELDİ — ${sym} SHORT</b>\n\nFiyat: $${f(pos.tp1)}\nKâr: ~%${((pos.entry-pos.tp1)/pos.entry*100*pos.leverage).toFixed(1)} (${pos.leverage}x)\n\n💡 Kârın bir kısmını al, SL'i aşağı çek.`);
           }
         }
-      }
-
-      // Pozisyon 24 saatten eski ve hiç TP/SL değmediyse otomatik temizle (giriş olmadı sayılır)
-      if (!closePos && Date.now() - pos.openTime > 24*60*60*1000) {
-        closePos = true;
-        console.log(`${sym} pozisyonu 24s doldu, temizlendi (giriş gerçekleşmemiş olabilir)`);
       }
 
       if (closePos) delete openPositions[sym];
@@ -833,7 +1032,9 @@ async function scanForSignals() {
       openPositions[coin.sym] = {
         sym: coin.sym, dir: sig.dir,
         entry: lv.entry, sl: lv.sl, tp1: lv.tp1, tp2: lv.tp2, tp3: lv.tp3,
+        entryZoneLow: lv.entryZoneLow, entryZoneHigh: lv.entryZoneHigh,
         leverage: lv.leverage, openTime: Date.now(), tpHit: [],
+        filled: lv.inZone,   // fiyat zaten bölgedeyse giriş yapıldı say, değilse bekle
         dec: price > 100 ? 2 : price > 1 ? 4 : 6,
       };
 
@@ -872,6 +1073,40 @@ ${lv.inZone ? '🟢 <i>Fiyat şu an giriş bölgesinde - hemen girilebilir.</i>'
 
       await sendTelegram(msg);
       console.log(new Date().toLocaleTimeString('tr-TR'), `- ✅ Sinyal gönderildi: ${coin.sym} ${sig.dir} %${sig.confidence}`);
+
+      // ── GERÇEK İŞLEM AÇ (LIVE_TRADING=true ise) ──
+      if (TRADE.live && tradingState.enabled && !tradingState.haltedReason) {
+        // Günlük zarar limiti kontrolü
+        const canTrade = await checkDailyLossLimit();
+        if (!canTrade) {
+          await sendTelegram(`🛑 <b>İŞLEM DURDURULDU</b>\n${tradingState.haltedReason}\nBot bugün yeni işlem açmayacak. Yarın sıfırlanır veya /islembaslat ile aç.`);
+        } else {
+          const balance = await getOKXBalance();
+          if (!balance || balance < 5) {
+            await sendTelegram(`⚠️ <b>${coin.sym}</b> işlem açılamadı: yetersiz bakiye ($${balance || 0}).`);
+          } else {
+            const result = await openOKXPosition(coin.sym, sig.dir, lv.entry, lv.sl, lv.tp2, lv.leverage, balance);
+            if (result.ok) {
+              openPositions[coin.sym].okxOrdId = result.ordId;
+              openPositions[coin.sym].contracts = result.contracts;
+              openPositions[coin.sym].live = true;
+              await sendTelegram(
+                `✅ <b>GERÇEK İŞLEM AÇILDI — ${coin.sym} ${sig.dir}</b>\n\n` +
+                `📍 Limit emir: $${f(result.px)}\n` +
+                `📦 Kontrat: ${result.contracts}\n` +
+                `⚡ Kaldıraç: ${lv.leverage}x\n` +
+                `🛑 SL ve 🎯 TP otomatik kuruldu.\n` +
+                `💰 Risk: bakiyenin %${TRADE.riskPerTrade}'si\n\n` +
+                `Fiyat giriş seviyesine gelince emir dolacak.`
+              );
+              console.log(`💰 GERÇEK İŞLEM: ${coin.sym} ${sig.dir} ${result.contracts} kontrat @ ${result.px}`);
+            } else {
+              await sendTelegram(`⚠️ <b>${coin.sym}</b> işlem açılamadı: ${result.msg}`);
+              console.error(`İşlem hatası ${coin.sym}:`, result.msg);
+            }
+          }
+        }
+      }
 
       // Small delay between messages
       await new Promise(r => setTimeout(r, 1000));
@@ -1151,6 +1386,35 @@ async function pollCommands() {
       const text = msg.text.trim();
 
       // /coins komutu - kaç coin var
+      // /islemdur - otomatik gerçek işlemi durdur
+      if (text === '/islemdur' || text === '/dur') {
+        tradingState.enabled = false;
+        await sendTelegramTo(chatId, '🛑 <b>Otomatik işlem DURDURULDU.</b>\n\nSinyaller gelmeye devam eder ama gerçek işlem açılmaz. Tekrar başlatmak için /islembaslat yaz.');
+        continue;
+      }
+      // /islembaslat - otomatik gerçek işlemi başlat
+      if (text === '/islembaslat' || text === '/basla') {
+        tradingState.enabled = true;
+        tradingState.haltedReason = null;
+        const mode = TRADE.live ? 'GERÇEK PARA' : 'sadece sinyal (LIVE_TRADING kapalı)';
+        await sendTelegramTo(chatId, `✅ <b>Otomatik işlem BAŞLATILDI.</b>\n\nMod: ${mode}\nRisk: %${TRADE.riskPerTrade}/işlem · Günlük fren: -%${TRADE.dailyLossLimit}`);
+        continue;
+      }
+      // /bakiye - OKX bakiyesini göster
+      if (text === '/bakiye' || text === '/balance') {
+        if (!OKX_API_KEY) {
+          await sendTelegramTo(chatId, '⚠️ OKX API bağlı değil. Bakiye görüntülenemez.');
+        } else {
+          const bal = await getOKXBalance();
+          if (bal === null) await sendTelegramTo(chatId, '⚠️ Bakiye alınamadı. API anahtarlarını kontrol et.');
+          else {
+            const halt = tradingState.haltedReason ? `\n🛑 ${tradingState.haltedReason}` : '';
+            await sendTelegramTo(chatId, `💰 <b>OKX Bakiye:</b> $${bal.toFixed(2)} USDT\n\nİşlem modu: ${TRADE.live ? '🟢 GERÇEK' : '🟡 sinyal'}\nDurum: ${tradingState.enabled ? 'aktif' : 'durduruldu'}${halt}`);
+          }
+        }
+        continue;
+      }
+
       // /positions veya /pozisyonlar - açık pozisyonları göster
       if (text === '/positions' || text === '/pozisyonlar' || text === '/poz') {
         const syms = Object.keys(openPositions);
@@ -1164,9 +1428,15 @@ async function pollCommands() {
             const emoji = p.dir === 'LONG' ? '🟢' : '🔴';
             const tpStatus = [1,2,3].map(n => p.tpHit.includes(n) ? `TP${n}✅` : `TP${n}`).join(' ');
             const mins = Math.round((Date.now() - p.openTime) / 60000);
-            msg += `${emoji} <b>${sym} ${p.dir}</b> (${p.leverage}x)\n`;
-            msg += `   Giriş: $${f(p.entry)} · SL: $${f(p.sl)}\n`;
-            msg += `   ${tpStatus} · ${mins}dk önce\n\n`;
+            const durum = p.filled ? '🟢 AÇIK' : '⏳ giriş bekliyor';
+            msg += `${emoji} <b>${sym} ${p.dir}</b> (${p.leverage}x) — ${durum}\n`;
+            if (p.filled) {
+              msg += `   Giriş: $${f(p.entry)} · SL: $${f(p.sl)}\n`;
+              msg += `   ${tpStatus} · ${mins}dk önce\n\n`;
+            } else {
+              msg += `   Giriş bölgesi: $${f(p.entryZoneLow)} - $${f(p.entryZoneHigh)}\n`;
+              msg += `   Fiyat gelince açılacak · ${mins}dk önce\n\n`;
+            }
           }
           msg += `Kapatmak için: <code>/kapat ${syms[0]}</code>`;
           await sendTelegramTo(chatId, msg);
@@ -1235,7 +1505,10 @@ async function pollCommands() {
           '📋 <code>/coins</code> — kaç coin var gör\n' +
           '📜 <code>/list</code> — mevcut coinleri listele\n' +
           '📊 <code>/positions</code> — açık pozisyonları gör\n' +
-          '✖️ <code>/kapat BTC</code> — pozisyonu takipten çıkar\n\n' +
+          '✖️ <code>/kapat BTC</code> — pozisyonu takipten çıkar\n' +
+          '💰 <code>/bakiye</code> — OKX bakiyeni gör\n' +
+          '🛑 <code>/islemdur</code> — otomatik işlemi durdur\n' +
+          '✅ <code>/islembaslat</code> — otomatik işlemi başlat\n\n' +
           '🔔 Otomatik sinyaller %' + CONFIG.minConfidence + '+ güvende gelir.\n\n' +
           'Hadi bir coin yaz, analiz edeyim! 🚀'
         );
@@ -1301,7 +1574,8 @@ async function start() {
     '💬 <b>Coin analizi için ismini yaz!</b>\n' +
     'Örn: <code>BTC</code> veya <code>SOL 5m</code>\n\n' +
     'Komutlar için /help yaz.\n\n' +
-    'Yüksek güvenli sinyaller buraya gelecek. İyi işlemler! 🚀'
+    `\n${TRADE.live ? '🟢 <b>GERÇEK İŞLEM MODU AKTİF</b>\nSinyallerde otomatik OKX işlemi açılacak.\nRisk: %' + TRADE.riskPerTrade + '/işlem · Günlük fren: -%' + TRADE.dailyLossLimit + '\n/islemdur ile durdurabilirsin.' : '🟡 <b>Sinyal modu</b> (gerçek işlem kapalı)\nGerçek işlem için Railway'+String.fromCharCode(39)+'de LIVE_TRADING=true yap.'}\n\n` +
+    'İyi işlemler! 🚀'
   );
 
   if (!ok) {
