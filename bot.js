@@ -4,8 +4,13 @@
 // Dashboard'daki aynı analiz motorunu kullanır
 // ================================================================
 
-const TG_TOKEN   = process.env.TG_TOKEN   || 'BURAYA_BOT_TOKEN';
-const TG_CHAT_ID = process.env.TG_CHAT_ID || 'BURAYA_CHAT_ID';
+// Tırnak, boşluk ve fazladan karakterleri temizle (Railway bazen tırnak ekler)
+function clean(v) {
+  if (!v) return '';
+  return String(v).trim().replace(/^["']+|["']+$/g, '').trim();
+}
+const TG_TOKEN   = clean(process.env.TG_TOKEN)   || 'BURAYA_BOT_TOKEN';
+const TG_CHAT_ID = clean(process.env.TG_CHAT_ID) || 'BURAYA_CHAT_ID';
 
 // Ayarlar
 const CONFIG = {
