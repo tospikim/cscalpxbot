@@ -369,6 +369,155 @@ ${sig.signals.slice(0, 4).map(s => '• ' + s).join('\n')}${btNote}
 }
 
 // ================================================================
+// ================================================================
+// KOMUT SİSTEMİ - kullanıcı coin yazınca analiz döner
+// ================================================================
+
+// Belirli bir chat'e mesaj gönder (komut cevapları için)
+async function sendTelegramTo(chatId, text) {
+  const url = `https://api.telegram.org/bot${TG_TOKEN}/sendMessage`;
+  try {
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: chatId, text, parse_mode: 'HTML',
+        disable_web_page_preview: true,
+      }),
+    });
+    return (await r.json()).ok;
+  } catch (e) { return false; }
+}
+
+// Bir coin için tam analiz mesajı oluştur
+async function analyzeCoinForCommand(symbol, tf) {
+  tf = tf || CONFIG.scalpTF;
+  const sym = symbol.toUpperCase().replace('USDT', '').replace('/', '').trim();
+
+  const bars = await fetchOHLC(sym, tf);
+  if (!bars || bars.length < 30) {
+    return `❌ <b>${sym}</b> için veri bulunamadı.\n\nDoğru coin ismi yazdığından emin ol (örn: BTC, ETH, SOL, PEPE).`;
+  }
+
+  const price = bars[bars.length - 1].c;
+  const sig = calcScalpSignal(bars, price);
+  const bt  = backtestScalp(bars, tf);
+
+  if (!sig) return `❌ <b>${sym}</b> analiz edilemedi.`;
+
+  const dec = price > 100 ? 2 : price > 1 ? 4 : 6;
+  const f = v => v.toLocaleString('tr-TR', { minimumFractionDigits: dec, maximumFractionDigits: dec });
+
+  // Entry/SL/TP hesapla
+  const atr = sig.atr || price * 0.005;
+  const slPctMax = { '1m': 0.005, '5m': 0.008, '15m': 0.012 }[tf] || 0.008;
+  const slDist = Math.min(atr * 0.8, price * slPctMax);
+  const entry = price;
+  const sl  = sig.dir === 'LONG' ? entry - slDist : entry + slDist;
+  const tp1 = sig.dir === 'LONG' ? entry + slDist * 1 : entry - slDist * 1;
+  const tp2 = sig.dir === 'LONG' ? entry + slDist * 2 : entry - slDist * 2;
+  const tp3 = sig.dir === 'LONG' ? entry + slDist * 3.5 : entry - slDist * 3.5;
+
+  const dirEmoji = sig.dir === 'LONG' ? '🟢⬆️' : '🔴⬇️';
+  const confEmoji = sig.confidence >= 75 ? '🔥' : sig.confidence >= 60 ? '✅' : '⚠️';
+  const flow = sig.orderFlow;
+
+  const btNote = bt && bt.total > 0
+    ? `\n📊 <b>Backtest:</b> %${bt.winRate} kazanma (${bt.total} işlem, P/L: ${bt.profitable ? '+' : ''}${bt.totalPnl}%)`
+    : '\n📊 Backtest: yeterli veri yok';
+
+  let recommendation;
+  if (sig.confidence >= 75) {
+    recommendation = `${confEmoji} <b>GÜÇLÜ ${sig.dir} SİNYALİ</b> — Giriş için uygun`;
+  } else if (sig.confidence >= 60) {
+    recommendation = `${confEmoji} <b>ORTA ${sig.dir} EĞİLİMİ</b> — Dikkatli ol, teyit bekle`;
+  } else {
+    recommendation = `${confEmoji} <b>ZAYIF SİNYAL</b> — Şu an net giriş yok, bekle`;
+  }
+
+  return `${dirEmoji} <b>${sym} ANALİZ — ${tf}</b>
+
+💰 Fiyat: <b>$${f(price)}</b>
+🎯 Güven: <b>%${sig.confidence}</b>
+${recommendation}
+
+<b>Giriş Seviyeleri (${sig.dir}):</b>
+▫️ Giriş: $${f(entry)}
+🛑 SL: $${f(sl)} (${(slDist / entry * 100).toFixed(2)}%)
+✅ TP1: $${f(tp1)}
+✅ TP2: $${f(tp2)}
+✅ TP3: $${f(tp3)}
+
+<b>Sinyaller:</b>
+${sig.signals.length ? sig.signals.slice(0, 5).map(s => '• ' + s).join('\n') : '• Net sinyal yok'}
+${flow ? `\n<b>Order Flow:</b> Alım %${flow.buyPct.toFixed(0)} / Satım %${flow.sellPct.toFixed(0)}` : ''}
+📈 RSI: ${sig.rsiNow ? sig.rsiNow.toFixed(1) : '--'}${btNote}
+
+⚠️ <i>Yatırım tavsiyesi değildir.</i>`;
+}
+
+// Gelen mesajları dinle (long polling)
+let lastUpdateId = 0;
+async function pollCommands() {
+  try {
+    const url = `https://api.telegram.org/bot${TG_TOKEN}/getUpdates?offset=${lastUpdateId + 1}&timeout=30`;
+    const r = await fetch(url);
+    const d = await r.json();
+    if (!d.ok || !d.result) return;
+
+    for (const update of d.result) {
+      lastUpdateId = update.update_id;
+      const msg = update.message;
+      if (!msg || !msg.text) continue;
+
+      const chatId = msg.chat.id;
+      const text = msg.text.trim();
+
+      // /start veya /help komutu
+      if (text === '/start' || text === '/help') {
+        await sendTelegramTo(chatId,
+          '🤖 <b>CryptoPro Bot Komutları</b>\n\n' +
+          '📊 <b>Coin analizi için:</b>\n' +
+          'Sadece coin ismini yaz, örn:\n' +
+          '<code>BTC</code> veya <code>ETH</code> veya <code>SOL</code>\n\n' +
+          '⏱️ <b>Zaman dilimi seçmek için:</b>\n' +
+          '<code>BTC 1m</code> (1 dakika)\n' +
+          '<code>BTC 5m</code> (5 dakika)\n' +
+          '<code>BTC 15m</code> (15 dakika)\n\n' +
+          '🔔 Otomatik sinyaller %' + CONFIG.minConfidence + '+ güvende gelir.\n\n' +
+          'Hadi bir coin yaz, analiz edeyim! 🚀'
+        );
+        continue;
+      }
+
+      // Komut mesajlarını atla (/ ile başlayan diğerleri)
+      if (text.startsWith('/')) continue;
+
+      // Coin + opsiyonel TF parse et (örn "BTC 5m" veya "btc")
+      const parts = text.split(/\s+/);
+      const coinSym = parts[0];
+      const tf = parts[1] && ['1m','5m','15m','1h'].includes(parts[1]) ? parts[1] : CONFIG.scalpTF;
+
+      // Geçerli coin ismi mi (harf, max 12 karakter)
+      if (!/^[A-Za-z0-9]{2,12}$/.test(coinSym)) {
+        await sendTelegramTo(chatId, '❓ Geçerli bir coin ismi yaz (örn: <code>BTC</code>, <code>ETH</code>, <code>SOL</code>).\n\nKomutlar için /help yaz.');
+        continue;
+      }
+
+      // "Analiz ediliyor" mesajı
+      await sendTelegramTo(chatId, `⏳ <b>${coinSym.toUpperCase()}</b> analiz ediliyor (${tf})...`);
+
+      // Analiz yap ve gönder
+      const analysis = await analyzeCoinForCommand(coinSym, tf);
+      await sendTelegramTo(chatId, analysis);
+      console.log(new Date().toLocaleTimeString('tr-TR'), `- Komut: ${coinSym} ${tf} → ${chatId}`);
+    }
+  } catch (e) {
+    console.error('Poll error:', e.message);
+  }
+}
+
+// ================================================================
 // START
 // ================================================================
 async function start() {
@@ -382,6 +531,9 @@ async function start() {
     `🎯 Min güven: %${CONFIG.minConfidence}\n` +
     `⏱️ Scalp TF: ${CONFIG.scalpTF}\n` +
     `📊 Backtest filtresi: ${CONFIG.requireBacktest ? 'Açık (min %' + CONFIG.minWinRate + ')' : 'Kapalı'}\n\n` +
+    '💬 <b>Coin analizi için ismini yaz!</b>\n' +
+    'Örn: <code>BTC</code> veya <code>SOL 5m</code>\n\n' +
+    'Komutlar için /help yaz.\n\n' +
     'Yüksek güvenli sinyaller buraya gelecek. İyi işlemler! 🚀'
   );
 
@@ -396,6 +548,12 @@ async function start() {
 
   // Then scan periodically
   setInterval(scanForSignals, CONFIG.scanInterval);
+
+  // Komut dinleme döngüsü (sürekli)
+  console.log('💬 Komut dinleyici aktif - coin ismi yazarak analiz alabilirsin');
+  while (true) {
+    await pollCommands();
+  }
 }
 
 start();
