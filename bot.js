@@ -34,6 +34,8 @@ const CONFIG = {
 };
 
 const alarmHistory = {};
+// Açık pozisyonlar: { "BTCLONG": { sym, dir, entry, sl, tp1, tp2, tp3, leverage, openTime, tpHit:[] } }
+const openPositions = {};
 
 // ── Telegram mesaj gönder ──
 async function sendTelegram(text) {
@@ -378,11 +380,29 @@ function calcEntryLevels(sig, price, tf) {
   // Ulaşılabilir mi: ya bölgede ya da makul mesafede
   const reachable = inZone || distToZone <= maxReach;
 
+  // ── KALDIRAÇ ÖNERİSİ ──
+  // Mantık: Pozisyon başına bakiyenin max %X'i riske edilir (varsayılan %2).
+  // Kaldıraç = hedef risk / SL yüzdesi. Dar SL → yüksek kaldıraç olabilir ama güvenli sınır koyarız.
+  const slPctVal = finalSlDist / entry * 100;
+  const RISK_PER_TRADE = 2;        // bakiyenin %2'si riske edilir
+  // Ham kaldıraç: SL %1 ise 2x risk için 2x kaldıraç; SL %0.5 ise 4x...
+  let rawLev = slPctVal > 0 ? RISK_PER_TRADE / slPctVal : 1;
+  // Scalp için güvenli kaldıraç aralığı (TF'ye göre tavan)
+  const levCap = { '1m':20,'3m':18,'5m':15,'15m':12,'30m':10,'1h':8,'2h':6,'4h':5,'1d':3,'1w':2 }[tf] || 10;
+  let leverage = Math.max(1, Math.min(levCap, Math.round(rawLev)));
+  // Güven düşükse kaldıracı azalt
+  if (sig.confidence < 75) leverage = Math.max(1, Math.round(leverage * 0.7));
+  // Likidasyon mesafesi tahmini (kaldıraçlı, ~%100/lev)
+  const liqDistPct = 100 / leverage;
+  // SL likidasyondan önce mi? (güvenli olmalı)
+  const slSafe = slPctVal < liqDistPct * 0.8;
+
   return {
     entry, sl: finalSl, tp1, tp2, tp3,
     entryZoneLow, entryZoneHigh,
-    slDist: finalSlDist, slPct: finalSlDist / entry * 100,
+    slDist: finalSlDist, slPct: slPctVal,
     distToZone, maxReach, inZone, reachable,
+    leverage, riskPerTrade: RISK_PER_TRADE, liqDistPct, slSafe,
   };
 }
 
@@ -667,6 +687,90 @@ async function fetchHotCoins() {
 // ================================================================
 // SIGNAL SCANNER
 // ================================================================
+// ================================================================
+// AÇIK POZİSYON TAKİBİ - SL/TP geldiğinde bildirim gönder
+// ================================================================
+async function monitorPositions() {
+  const syms = Object.keys(openPositions);
+  if (syms.length === 0) return;
+
+  for (const sym of syms) {
+    const pos = openPositions[sym];
+    try {
+      // Güncel fiyatı çek (1m mum, en güncel)
+      const bars = await fetchOHLC(sym, '1m');
+      if (!bars || !bars.length) continue;
+      const cur = bars[bars.length - 1];
+      const price = cur.c;
+      const high = cur.h, low = cur.l;
+      const f = v => v.toLocaleString('tr-TR', { minimumFractionDigits: pos.dec, maximumFractionDigits: pos.dec });
+
+      let closePos = false;
+
+      if (pos.dir === 'LONG') {
+        // SL kontrolü (fiyat SL'in altına indi mi)
+        if (low <= pos.sl) {
+          await sendTelegram(
+            `🛑 <b>SL OLDU — ${sym} LONG</b>\n\n` +
+            `Giriş: $${f(pos.entry)}\n` +
+            `SL: $${f(pos.sl)} ✋\n` +
+            `Kayıp: ~%${((pos.entry - pos.sl)/pos.entry*100*pos.leverage).toFixed(1)} (${pos.leverage}x)\n\n` +
+            `İşlem kapandı. Bu coin için yeni sinyal aranabilir.`
+          );
+          closePos = true;
+        }
+        // TP kontrolleri (fiyat TP'lerin üstüne çıktı mı)
+        else {
+          if (high >= pos.tp3 && !pos.tpHit.includes(3)) {
+            pos.tpHit.push(3);
+            await sendTelegram(`🎯🎯🎯 <b>TP3 GELDİ — ${sym} LONG</b>\n\nFiyat: $${f(pos.tp3)}\nKâr: ~%${((pos.tp3-pos.entry)/pos.entry*100*pos.leverage).toFixed(1)} (${pos.leverage}x)\n\n✅ Tüm hedefler tamam! Pozisyonu kapatabilirsin.`);
+            closePos = true;
+          } else if (high >= pos.tp2 && !pos.tpHit.includes(2)) {
+            pos.tpHit.push(2);
+            await sendTelegram(`🎯🎯 <b>TP2 GELDİ — ${sym} LONG</b>\n\nFiyat: $${f(pos.tp2)}\nKâr: ~%${((pos.tp2-pos.entry)/pos.entry*100*pos.leverage).toFixed(1)} (${pos.leverage}x)\n\n💡 SL'i girişe çek (zarara geçme), TP3 bekle.`);
+          } else if (high >= pos.tp1 && !pos.tpHit.includes(1)) {
+            pos.tpHit.push(1);
+            await sendTelegram(`🎯 <b>TP1 GELDİ — ${sym} LONG</b>\n\nFiyat: $${f(pos.tp1)}\nKâr: ~%${((pos.tp1-pos.entry)/pos.entry*100*pos.leverage).toFixed(1)} (${pos.leverage}x)\n\n💡 Kârın bir kısmını al, SL'i yukarı çek.`);
+          }
+        }
+      } else { // SHORT
+        if (high >= pos.sl) {
+          await sendTelegram(
+            `🛑 <b>SL OLDU — ${sym} SHORT</b>\n\n` +
+            `Giriş: $${f(pos.entry)}\n` +
+            `SL: $${f(pos.sl)} ✋\n` +
+            `Kayıp: ~%${((pos.sl - pos.entry)/pos.entry*100*pos.leverage).toFixed(1)} (${pos.leverage}x)\n\n` +
+            `İşlem kapandı. Bu coin için yeni sinyal aranabilir.`
+          );
+          closePos = true;
+        } else {
+          if (low <= pos.tp3 && !pos.tpHit.includes(3)) {
+            pos.tpHit.push(3);
+            await sendTelegram(`🎯🎯🎯 <b>TP3 GELDİ — ${sym} SHORT</b>\n\nFiyat: $${f(pos.tp3)}\nKâr: ~%${((pos.entry-pos.tp3)/pos.entry*100*pos.leverage).toFixed(1)} (${pos.leverage}x)\n\n✅ Tüm hedefler tamam! Pozisyonu kapatabilirsin.`);
+            closePos = true;
+          } else if (low <= pos.tp2 && !pos.tpHit.includes(2)) {
+            pos.tpHit.push(2);
+            await sendTelegram(`🎯🎯 <b>TP2 GELDİ — ${sym} SHORT</b>\n\nFiyat: $${f(pos.tp2)}\nKâr: ~%${((pos.entry-pos.tp2)/pos.entry*100*pos.leverage).toFixed(1)} (${pos.leverage}x)\n\n💡 SL'i girişe çek, TP3 bekle.`);
+          } else if (low <= pos.tp1 && !pos.tpHit.includes(1)) {
+            pos.tpHit.push(1);
+            await sendTelegram(`🎯 <b>TP1 GELDİ — ${sym} SHORT</b>\n\nFiyat: $${f(pos.tp1)}\nKâr: ~%${((pos.entry-pos.tp1)/pos.entry*100*pos.leverage).toFixed(1)} (${pos.leverage}x)\n\n💡 Kârın bir kısmını al, SL'i aşağı çek.`);
+          }
+        }
+      }
+
+      // Pozisyon 24 saatten eski ve hiç TP/SL değmediyse otomatik temizle (giriş olmadı sayılır)
+      if (!closePos && Date.now() - pos.openTime > 24*60*60*1000) {
+        closePos = true;
+        console.log(`${sym} pozisyonu 24s doldu, temizlendi (giriş gerçekleşmemiş olabilir)`);
+      }
+
+      if (closePos) delete openPositions[sym];
+    } catch (e) {
+      console.error(`${sym} pozisyon takip hatası:`, e.message);
+    }
+  }
+}
+
 async function scanForSignals() {
   const coins = await fetchHotCoins();
   if (!coins.length) {
@@ -682,7 +786,7 @@ async function scanForSignals() {
   console.log(new Date().toLocaleTimeString('tr-TR'), `- ${coins.length} coin hacim filtresinden geçti, ${candidates.length} tanesi detaylı taranıyor...`);
   let found = 0;
   // Teşhis sayaçları - neden sinyal verilmediğini görmek için
-  let noData = 0, lowConf = 0, deduped = 0, btFail = 0, scanned = 0, unreachable = 0;
+  let noData = 0, lowConf = 0, deduped = 0, btFail = 0, scanned = 0, unreachable = 0, hasOpen = 0;
   let bestSeen = { sym: null, conf: 0 };
 
   for (const coin of candidates) {
@@ -717,11 +821,21 @@ async function scanForSignals() {
       const lv = calcEntryLevels(sig, price, CONFIG.scalpTF);
 
       // ULAŞILABİLİRLİK: giriş bölgesi fiyata çok uzaksa sinyal verme
-      // (örn fiyat $1, giriş $2 → fiyat oraya gelmeyebilir)
       if (!lv.reachable) { unreachable++; continue; }
+
+      // AÇIK POZİSYON KONTROLÜ: bu coinde zaten açık pozisyon varsa yeni sinyal verme
+      if (openPositions[coin.sym]) { hasOpen++; continue; }
 
       alarmHistory[key] = now;
       found++;
+
+      // Pozisyonu kaydet (takip için)
+      openPositions[coin.sym] = {
+        sym: coin.sym, dir: sig.dir,
+        entry: lv.entry, sl: lv.sl, tp1: lv.tp1, tp2: lv.tp2, tp3: lv.tp3,
+        leverage: lv.leverage, openTime: Date.now(), tpHit: [],
+        dec: price > 100 ? 2 : price > 1 ? 4 : 6,
+      };
 
       const dec = price > 100 ? 2 : price > 1 ? 4 : 6;
       const f = v => v.toLocaleString('tr-TR', { minimumFractionDigits: dec, maximumFractionDigits: dec });
@@ -746,6 +860,9 @@ $${f(lv.entryZoneLow)} — $${f(lv.entryZoneHigh)}
 ✅ TP2: $${f(lv.tp2)}
 ✅ TP3: $${f(lv.tp3)}
 
+<b>⚡ Önerilen Kaldıraç: ${lv.leverage}x</b>
+<i>(Bakiyenin %${lv.riskPerTrade}'si risk · SL'de ~%${(lv.slPct*lv.leverage).toFixed(1)} kayıp)</i>
+
 <b>Sinyaller:</b>
 ${sig.signals.slice(0, 5).map(s => '• ' + s).join('\n')}${btNote}
 
@@ -766,7 +883,7 @@ ${lv.inZone ? '🟢 <i>Fiyat şu an giriş bölgesinde - hemen girilebilir.</i>'
   // Detaylı teşhis logu
   console.log(new Date().toLocaleTimeString('tr-TR'),
     `- ✅ Tarama bitti | Tarandı: ${scanned} | Sinyal: ${found} | ` +
-    `Düşük güven: ${lowConf} | Backtest: ${btFail} | Uzak giriş: ${unreachable} | Tekrar: ${deduped} | Veri yok: ${noData}`);
+    `Düşük güven: ${lowConf} | Backtest: ${btFail} | Uzak: ${unreachable} | Açık poz: ${hasOpen} | Tekrar: ${deduped} | Veri yok: ${noData}`);
   if (found === 0 && bestSeen.sym) {
     console.log(`   ℹ️ En yüksek güven: ${bestSeen.sym} ${bestSeen.dir||''} %${bestSeen.conf} (eşik %${CONFIG.minConfidence}). Uygun fırsat bulunamadı, bu normal.`);
   }
@@ -932,6 +1049,9 @@ ${lv.inZone ? '🟢 <b>Fiyat şu an giriş bölgesinde - işleme girilebilir</b>
 ✅ TP2: $${f(tp2)}
 ✅ TP3: $${f(tp3)}
 
+<b>⚡ Önerilen Kaldıraç: ${lv.leverage}x</b>
+<i>(Bakiyenin %${lv.riskPerTrade}'si risk · SL'de ~%${(lv.slPct*lv.leverage).toFixed(1)} kayıp)</i>
+
 <b>Sinyaller:</b>
 ${sig.signals.length ? sig.signals.slice(0,4).map(s=>'• '+s).join('\n') : '• Net sinyal yok'}
 ${flow ? `\n<b>Order Flow:</b> Alım %${flow.buyPct.toFixed(0)} / Satım %${flow.sellPct.toFixed(0)}` : ''}
@@ -1001,6 +1121,9 @@ ${lv.inZone ? '🟢 <b>Fiyat şu an giriş bölgesinde - işleme girilebilir</b>
 ✅ TP2: $${f(tp2)}
 ✅ TP3: $${f(tp3)}
 
+<b>⚡ Önerilen Kaldıraç: ${lv.leverage}x</b>
+<i>(Bakiyenin %${lv.riskPerTrade}'si risk · SL'de ~%${(lv.slPct*lv.leverage).toFixed(1)} kayıp)</i>
+
 <b>Sinyaller:</b>
 ${sig.signals.length ? sig.signals.slice(0, 5).map(s => '• ' + s).join('\n') : '• Net sinyal yok'}
 ${flow ? `\n<b>Order Flow:</b> Alım %${flow.buyPct.toFixed(0)} / Satım %${flow.sellPct.toFixed(0)}` : ''}
@@ -1028,6 +1151,41 @@ async function pollCommands() {
       const text = msg.text.trim();
 
       // /coins komutu - kaç coin var
+      // /positions veya /pozisyonlar - açık pozisyonları göster
+      if (text === '/positions' || text === '/pozisyonlar' || text === '/poz') {
+        const syms = Object.keys(openPositions);
+        if (syms.length === 0) {
+          await sendTelegramTo(chatId, '📭 Şu an açık pozisyon yok.\n\nBot yeni fırsat buldukça sinyal gönderecek.');
+        } else {
+          let msg = `📊 <b>Açık Pozisyonlar (${syms.length})</b>\n\n`;
+          for (const sym of syms) {
+            const p = openPositions[sym];
+            const f = v => v.toLocaleString('tr-TR', { minimumFractionDigits: p.dec, maximumFractionDigits: p.dec });
+            const emoji = p.dir === 'LONG' ? '🟢' : '🔴';
+            const tpStatus = [1,2,3].map(n => p.tpHit.includes(n) ? `TP${n}✅` : `TP${n}`).join(' ');
+            const mins = Math.round((Date.now() - p.openTime) / 60000);
+            msg += `${emoji} <b>${sym} ${p.dir}</b> (${p.leverage}x)\n`;
+            msg += `   Giriş: $${f(p.entry)} · SL: $${f(p.sl)}\n`;
+            msg += `   ${tpStatus} · ${mins}dk önce\n\n`;
+          }
+          msg += `Kapatmak için: <code>/kapat ${syms[0]}</code>`;
+          await sendTelegramTo(chatId, msg);
+        }
+        continue;
+      }
+
+      // /kapat COIN - pozisyonu manuel kapat (takipten çıkar)
+      if (text.toLowerCase().startsWith('/kapat ')) {
+        const sym = text.split(/\s+/)[1]?.toUpperCase();
+        if (sym && openPositions[sym]) {
+          delete openPositions[sym];
+          await sendTelegramTo(chatId, `✅ <b>${sym}</b> pozisyonu takipten çıkarıldı. Artık yeni sinyal verilebilir.`);
+        } else {
+          await sendTelegramTo(chatId, `❓ <b>${sym || '?'}</b> için açık pozisyon yok. Açık olanları görmek için /positions yaz.`);
+        }
+        continue;
+      }
+
       if (text === '/coins') {
         const okxCount = Object.keys(SYMBOL_REGISTRY.okx).length;
         const bnCount  = Object.keys(SYMBOL_REGISTRY.binance).length;
@@ -1075,7 +1233,9 @@ async function pollCommands() {
           '<b>Kullanılabilir zaman dilimleri:</b>\n' +
           '1m, 3m, 5m, 15m, 30m, 1h, 2h, 4h, 1d, 1w\n\n' +
           '📋 <code>/coins</code> — kaç coin var gör\n' +
-          '📜 <code>/list</code> — mevcut coinleri listele\n\n' +
+          '📜 <code>/list</code> — mevcut coinleri listele\n' +
+          '📊 <code>/positions</code> — açık pozisyonları gör\n' +
+          '✖️ <code>/kapat BTC</code> — pozisyonu takipten çıkar\n\n' +
           '🔔 Otomatik sinyaller %' + CONFIG.minConfidence + '+ güvende gelir.\n\n' +
           'Hadi bir coin yaz, analiz edeyim! 🚀'
         );
@@ -1158,6 +1318,10 @@ async function start() {
 
   // Then scan periodically
   setInterval(scanForSignals, CONFIG.scanInterval);
+
+  // Açık pozisyonları her 30 saniyede kontrol et (SL/TP bildirimleri için)
+  setInterval(monitorPositions, 30000);
+  console.log('📍 Pozisyon takibi aktif - SL/TP geldiğinde bildirim gelecek');
 
   // Komut dinleme döngüsü (sürekli)
   console.log('💬 Komut dinleyici aktif - coin ismi yazarak analiz alabilirsin');
