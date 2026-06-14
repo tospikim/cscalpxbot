@@ -150,6 +150,83 @@ function calcEMARibbon(bars) {
 }
 
 // ── MASTER SCALP SIGNAL ──
+// ── Destek/Direnç seviyeleri (swing high/low) ──
+function calcSupportResistance(bars, lookback) {
+  lookback = lookback || 50;
+  const recent = bars.slice(-lookback);
+  const swingHighs = [], swingLows = [];
+  // 2 mum solu+sağı pivot kontrolü
+  for (let i = 2; i < recent.length - 2; i++) {
+    const h = recent[i].h, l = recent[i].l;
+    if (h >= recent[i-1].h && h >= recent[i-2].h && h >= recent[i+1].h && h >= recent[i+2].h)
+      swingHighs.push(h);
+    if (l <= recent[i-1].l && l <= recent[i-2].l && l <= recent[i+1].l && l <= recent[i+2].l)
+      swingLows.push(l);
+  }
+  const price = recent[recent.length - 1].c;
+  // Fiyatın üstündeki en yakın direnç, altındaki en yakın destek
+  const resAbove = swingHighs.filter(h => h > price).sort((a,b) => a-b);
+  const supBelow = swingLows.filter(l => l < price).sort((a,b) => b-a);
+  return {
+    nearestRes: resAbove[0] || Math.max(...recent.map(b=>b.h)),
+    nearestSup: supBelow[0] || Math.min(...recent.map(b=>b.l)),
+    allHighs: swingHighs, allLows: swingLows,
+  };
+}
+
+// ── Bollinger Bantları ──
+function calcBollinger(bars, period, mult) {
+  period = period || 20; mult = mult || 2;
+  if (bars.length < period) return null;
+  const closes = bars.slice(-period).map(b => b.c);
+  const mean = closes.reduce((a,b) => a+b, 0) / period;
+  const variance = closes.reduce((a,b) => a + (b-mean)**2, 0) / period;
+  const std = Math.sqrt(variance);
+  return { upper: mean + mult*std, mid: mean, lower: mean - mult*std, std };
+}
+
+// ── Fibonacci geri çekilme (golden pocket 0.618) ──
+function calcFib(bars) {
+  const recent = bars.slice(-60);
+  const high = Math.max(...recent.map(b => b.h));
+  const low = Math.min(...recent.map(b => b.l));
+  const diff = high - low;
+  let hi = 0, lo = 0;
+  recent.forEach((b,i) => { if(b.h===high) hi=i; if(b.l===low) lo=i; });
+  const uptrend = lo < hi;
+  return {
+    high, low, uptrend,
+    // Golden pocket: yükselişte geri çekilme alımı, düşüşte tepki satışı
+    golden618: uptrend ? high - diff*0.618 : low + diff*0.618,
+    fib500: uptrend ? high - diff*0.5 : low + diff*0.5,
+    fib382: uptrend ? high - diff*0.382 : low + diff*0.382,
+  };
+}
+
+// ── RSI uyumsuzluğu (dönüş sinyali) ──
+function calcRSIDivergence(bars, rsiData) {
+  const n = bars.length;
+  if (n < 15) return { bull: false, bear: false };
+  const lookback = 14;
+  const pSlice = bars.slice(-lookback);
+  const rSlice = rsiData.slice(-lookback);
+  const lows = [], highs = [];
+  for (let i = 1; i < pSlice.length - 1; i++) {
+    if (pSlice[i].l < pSlice[i-1].l && pSlice[i].l < pSlice[i+1].l) lows.push({p: pSlice[i].l, r: rSlice[i]});
+    if (pSlice[i].h > pSlice[i-1].h && pSlice[i].h > pSlice[i+1].h) highs.push({p: pSlice[i].h, r: rSlice[i]});
+  }
+  let bull = false, bear = false;
+  if (lows.length >= 2) {
+    const a = lows[lows.length-2], b = lows[lows.length-1];
+    if (b.p < a.p && b.r > a.r) bull = true; // fiyat dip yapıyor ama RSI yükseliyor
+  }
+  if (highs.length >= 2) {
+    const a = highs[highs.length-2], b = highs[highs.length-1];
+    if (b.p > a.p && b.r < a.r) bear = true; // fiyat tepe yapıyor ama RSI düşüyor
+  }
+  return { bull, bear };
+}
+
 function calcScalpSignal(bars, price) {
   if (bars.length < 22) return null;
   const mom = calcMomentum(bars, 10);
@@ -158,42 +235,154 @@ function calcScalpSignal(bars, price) {
   const rsiData = rsiArr(bars.map(b => b.c), 14);
   const rsiNow = rsiData[rsiData.length - 1];
   const atr = calcATR(bars, 14);
+  const sr = calcSupportResistance(bars, 50);
+  const bb = calcBollinger(bars, 20, 2);
+  const fib = calcFib(bars);
+  const div = calcRSIDivergence(bars, rsiData);
+
+  // Fiyatın destek/dirence yakınlığı (% olarak)
+  const distToRes = sr.nearestRes ? (sr.nearestRes - price) / price * 100 : 99;
+  const distToSup = sr.nearestSup ? (price - sr.nearestSup) / price * 100 : 99;
 
   let longSig = 0, shortSig = 0;
   const signals = { long: [], short: [] };
 
-  if (mom) {
-    if (mom.roc > 0 && mom.rising) { longSig += 26; signals.long.push('Momentum yukarı + hızlanıyor'); }
-    else if (mom.roc > 0) { longSig += 14; signals.long.push('Momentum yukarı'); }
-    if (mom.roc < 0 && !mom.rising) { shortSig += 26; signals.short.push('Momentum aşağı + hızlanıyor'); }
-    else if (mom.roc < 0) { shortSig += 14; signals.short.push('Momentum aşağı'); }
+  // ═══════════════════════════════════════════════════════
+  // DÖNÜŞ MANTIGI: SHORT'u tepeden, LONG'u dipten yakala
+  // ═══════════════════════════════════════════════════════
+
+  // 1. DESTEK/DİRENÇ YAKINLIĞI (en önemli - dönüş buralarda olur)
+  if (distToRes < 0.5) { shortSig += 30; signals.short.push(`Dirence çok yakın ($${sr.nearestRes.toFixed(4)})`); }
+  else if (distToRes < 1.2) { shortSig += 18; signals.short.push('Dirence yaklaşıyor'); }
+  if (distToSup < 0.5) { longSig += 30; signals.long.push(`Desteğe çok yakın ($${sr.nearestSup.toFixed(4)})`); }
+  else if (distToSup < 1.2) { longSig += 18; signals.long.push('Desteğe yaklaşıyor'); }
+
+  // 2. BOLLINGER BANT (üst banda değdi=short, alt banda değdi=long)
+  if (bb) {
+    if (price >= bb.upper) { shortSig += 25; signals.short.push('Üst Bollinger bandında (aşırı uzamış)'); }
+    else if (price >= bb.upper - bb.std * 0.5) { shortSig += 12; signals.short.push('Üst banda yakın'); }
+    if (price <= bb.lower) { longSig += 25; signals.long.push('Alt Bollinger bandında (aşırı düşmüş)'); }
+    else if (price <= bb.lower + bb.std * 0.5) { longSig += 12; signals.long.push('Alt banda yakın'); }
   }
-  if (flow) {
-    if (flow.delta > 10) { longSig += 30; signals.long.push(`Güçlü alım baskısı (%${flow.buyPct.toFixed(0)})`); }
-    else if (flow.delta > 3) { longSig += 16; signals.long.push('Alım baskısı'); }
-    if (flow.delta < -10) { shortSig += 30; signals.short.push(`Güçlü satım baskısı (%${flow.sellPct.toFixed(0)})`); }
-    else if (flow.delta < -3) { shortSig += 16; signals.short.push('Satım baskısı'); }
-  }
-  if (ribbon) {
-    if (ribbon.trend === 'GUCLU YUKSELIS') { longSig += 28; signals.long.push('EMA ribbon boğa dizilimi'); }
-    else if (ribbon.trend === 'YUKSELIS') { longSig += 14; signals.long.push('EMA yukarı'); }
-    if (ribbon.trend === 'GUCLU DUSUS') { shortSig += 28; signals.short.push('EMA ribbon ayı dizilimi'); }
-    else if (ribbon.trend === 'DUSUS') { shortSig += 14; signals.short.push('EMA aşağı'); }
-  }
+
+  // 3. RSI AŞIRI BÖLGELER (dönüş bölgeleri)
   if (rsiNow !== null) {
-    if (rsiNow > 40 && rsiNow < 65) { longSig += 10; signals.long.push('RSI sağlıklı (40-65)'); }
-    if (rsiNow < 60 && rsiNow > 35) { shortSig += 10; signals.short.push('RSI sağlıklı (35-60)'); }
-    if (rsiNow < 30) { longSig += 18; signals.long.push('RSI aşırı satım dönüş'); }
-    if (rsiNow > 70) { shortSig += 18; signals.short.push('RSI aşırı alım dönüş'); }
+    if (rsiNow > 72) { shortSig += 22; signals.short.push(`RSI aşırı alım (${rsiNow.toFixed(0)})`); }
+    else if (rsiNow > 65) { shortSig += 10; signals.short.push('RSI yüksek'); }
+    if (rsiNow < 28) { longSig += 22; signals.long.push(`RSI aşırı satım (${rsiNow.toFixed(0)})`); }
+    else if (rsiNow < 35) { longSig += 10; signals.long.push('RSI düşük'); }
+  }
+
+  // 4. RSI UYUMSUZLUĞU (güçlü dönüş sinyali)
+  if (div.bear) { shortSig += 25; signals.short.push('Ayı uyumsuzluğu (fiyat↑ RSI↓)'); }
+  if (div.bull) { longSig += 25; signals.long.push('Boğa uyumsuzluğu (fiyat↓ RSI↑)'); }
+
+  // 5. FİBONACCİ GOLDEN POCKET (geri çekilme dönüş noktası)
+  if (fib) {
+    const gpDist = Math.abs(price - fib.golden618) / price * 100;
+    if (gpDist < 0.6) {
+      if (fib.uptrend) { longSig += 18; signals.long.push('Fib golden pocket (0.618) - alım bölgesi'); }
+      else { shortSig += 18; signals.short.push('Fib golden pocket (0.618) - satım bölgesi'); }
+    }
+  }
+
+  // 6. ORDER FLOW TEYİDİ (dönüşü onaylıyor mu)
+  if (flow) {
+    // Dirence yakınken satım baskısı başladıysa = short teyidi
+    if (distToRes < 1.2 && flow.delta < -3) { shortSig += 12; signals.short.push('Satım baskısı başladı'); }
+    // Desteğe yakınken alım baskısı başladıysa = long teyidi
+    if (distToSup < 1.2 && flow.delta > 3) { longSig += 12; signals.long.push('Alım baskısı başladı'); }
+  }
+
+  // 7. MUM DÖNÜŞ FORMASYONU (son mum dönüş gösteriyor mu)
+  const last = bars[bars.length-1], prev = bars[bars.length-2];
+  if (last && prev) {
+    const lastBody = last.c - last.o;
+    const lastRange = last.h - last.l || 0.0001;
+    const upperWick = last.h - Math.max(last.c, last.o);
+    const lowerWick = Math.min(last.c, last.o) - last.l;
+    // Üst fitil uzun = tepeden satış (short)
+    if (upperWick > lastRange * 0.5 && distToRes < 1.5) { shortSig += 12; signals.short.push('Uzun üst fitil (satış baskısı)'); }
+    // Alt fitil uzun = dipten alış (long)
+    if (lowerWick > lastRange * 0.5 && distToSup < 1.5) { longSig += 12; signals.long.push('Uzun alt fitil (alış baskısı)'); }
   }
 
   const dir = longSig >= shortSig ? 'LONG' : 'SHORT';
-  // Gerçekçi maksimum ~74 puan (mom 26 + flow 30 + ribbon 28 - örtüşme). 74'e normalize.
-  const confidence = Math.min(100, Math.round(Math.max(longSig, shortSig) / 74 * 100));
+  // Maksimum gerçekçi ~85 puan. Dönüş sinyalleri üst üste binince yüksek güven.
+  const confidence = Math.min(100, Math.round(Math.max(longSig, shortSig) / 85 * 100));
+
   return {
     dir, confidence,
     signals: dir === 'LONG' ? signals.long : signals.short,
     atr, rsiNow, orderFlow: flow,
+    sr, bb, fib,
+    distToRes, distToSup,
+  };
+}
+
+// ── AKILLI GİRİŞ/SL/TP HESAPLAMA (dönüş seviyelerine göre) ──
+function calcEntryLevels(sig, price, tf) {
+  const atr = sig.atr || price * 0.005;
+  const sr = sig.sr || {};
+
+  let entry, sl, entryZoneLow, entryZoneHigh;
+
+  if (sig.dir === 'LONG') {
+    // LONG: destekten gir. Giriş bölgesi = destek ile mevcut fiyat arası
+    const support = sr.nearestSup || (price - atr * 2);
+    // Giriş bölgesi: desteğin biraz üstü (fiyat oraya çekilince al)
+    entryZoneLow = support;
+    entryZoneHigh = Math.min(price, support + atr * 1.5);
+    entry = (entryZoneLow + entryZoneHigh) / 2; // bölge ortası
+    // SL: desteğin ALTINA (ATR kadar tampon) - kolay vurmasın
+    sl = support - atr * 1.2;
+  } else {
+    // SHORT: dirençten gir. Giriş bölgesi = mevcut fiyat ile direnç arası
+    const resistance = sr.nearestRes || (price + atr * 2);
+    entryZoneHigh = resistance;
+    entryZoneLow = Math.max(price, resistance - atr * 1.5);
+    entry = (entryZoneLow + entryZoneHigh) / 2;
+    // SL: direncin ÜSTÜNE (ATR tampon)
+    sl = resistance + atr * 1.2;
+  }
+
+  // SL mesafesi (giriş ile SL arası)
+  const slDist = Math.abs(entry - sl);
+  // Aşırı geniş SL'yi sınırla (TF'ye göre max %)
+  const slPctMax = { '1m':0.008,'5m':0.012,'15m':0.018,'30m':0.025,'1h':0.035,'2h':0.05,'4h':0.07,'1d':0.1,'1w':0.18 }[tf] || 0.015;
+  const maxSlDist = entry * slPctMax;
+  const finalSlDist = Math.min(slDist, maxSlDist);
+  // SL'yi yeniden hesapla (sınırlandıysa)
+  const finalSl = sig.dir === 'LONG' ? entry - finalSlDist : entry + finalSlDist;
+
+  // TP: R/R oranına göre (1:1.5, 1:2.5, 1:4)
+  const tp1 = sig.dir === 'LONG' ? entry + finalSlDist * 1.5 : entry - finalSlDist * 1.5;
+  const tp2 = sig.dir === 'LONG' ? entry + finalSlDist * 2.5 : entry - finalSlDist * 2.5;
+  const tp3 = sig.dir === 'LONG' ? entry + finalSlDist * 4   : entry - finalSlDist * 4;
+
+  // ── ULAŞILABİLİRLİK KONTROLÜ ──
+  // Giriş bölgesi şu anki fiyata ne kadar uzak? Çok uzaksa sinyal geçersiz.
+  // (örn: fiyat $1, giriş $2 ise → fiyat oraya gelmeyebilir, sinyal verme)
+  let distToZone;
+  if (sig.dir === 'LONG') {
+    // Fiyat giriş bölgesinin üstündeyse, düşmesi gerekir; bölge zaten altında
+    distToZone = price > entryZoneHigh ? (price - entryZoneHigh) / price * 100 : 0;
+  } else {
+    // SHORT: fiyat bölgenin altındaysa yükselmesi gerekir
+    distToZone = price < entryZoneLow ? (entryZoneLow - price) / price * 100 : 0;
+  }
+  // TF'ye göre max ulaşılabilir mesafe (kısa TF'de fiyat az hareket eder)
+  const maxReach = { '1m':0.6,'3m':0.9,'5m':1.2,'15m':2,'30m':3,'1h':4,'2h':6,'4h':9,'1d':15,'1w':30 }[tf] || 2;
+  // Fiyat zaten bölgenin içinde mi? (hemen girilebilir)
+  const inZone = price >= entryZoneLow && price <= entryZoneHigh;
+  // Ulaşılabilir mi: ya bölgede ya da makul mesafede
+  const reachable = inZone || distToZone <= maxReach;
+
+  return {
+    entry, sl: finalSl, tp1, tp2, tp3,
+    entryZoneLow, entryZoneHigh,
+    slDist: finalSlDist, slPct: finalSlDist / entry * 100,
+    distToZone, maxReach, inZone, reachable,
   };
 }
 
@@ -201,18 +390,16 @@ function calcScalpSignal(bars, price) {
 function backtestScalp(bars, tfId) {
   if (bars.length < 60) return null;
   let wins = 0, losses = 0, totalPnl = 0;
-  const slPctMax = { '1m': 0.005, '5m': 0.008, '15m': 0.012 }[tfId] || 0.008;
-  for (let i = 30; i < bars.length - 10; i++) {
+  for (let i = 50; i < bars.length - 10; i++) {
     const window = bars.slice(0, i + 1);
     const sig = calcScalpSignal(window, bars[i].c);
     if (!sig || sig.confidence < 60) continue;
-    const entry = bars[i].c;
-    const atr = sig.atr || entry * 0.005;
-    const slDist = Math.min(atr * 0.8, entry * slPctMax);
-    const sl = sig.dir === 'LONG' ? entry - slDist : entry + slDist;
-    const tp = sig.dir === 'LONG' ? entry + slDist * 2 : entry - slDist * 2;
+    const lv = calcEntryLevels(sig, bars[i].c, tfId);
+    const entry = lv.entry;
+    const sl = lv.sl;
+    const tp = lv.tp2; // TP2 hedefle (2.5:1)
     let outcome = null;
-    for (let j = i + 1; j < Math.min(i + 11, bars.length); j++) {
+    for (let j = i + 1; j < Math.min(i + 12, bars.length); j++) {
       const bar = bars[j];
       if (sig.dir === 'LONG') {
         if (bar.l <= sl) { outcome = 'loss'; break; }
@@ -222,8 +409,8 @@ function backtestScalp(bars, tfId) {
         if (bar.l <= tp) { outcome = 'win'; break; }
       }
     }
-    if (outcome === 'win') { wins++; totalPnl += slDist * 2 / entry * 100; }
-    if (outcome === 'loss') { losses++; totalPnl -= slDist / entry * 100; }
+    if (outcome === 'win') { wins++; totalPnl += Math.abs(tp - entry) / entry * 100; }
+    if (outcome === 'loss') { losses++; totalPnl -= Math.abs(sl - entry) / entry * 100; }
     i += 5;
   }
   const total = wins + losses;
@@ -495,7 +682,7 @@ async function scanForSignals() {
   console.log(new Date().toLocaleTimeString('tr-TR'), `- ${coins.length} coin hacim filtresinden geçti, ${candidates.length} tanesi detaylı taranıyor...`);
   let found = 0;
   // Teşhis sayaçları - neden sinyal verilmediğini görmek için
-  let noData = 0, lowConf = 0, deduped = 0, btFail = 0, scanned = 0;
+  let noData = 0, lowConf = 0, deduped = 0, btFail = 0, scanned = 0, unreachable = 0;
   let bestSeen = { sym: null, conf: 0 };
 
   for (const coin of candidates) {
@@ -525,44 +712,46 @@ async function scanForSignals() {
         }
       }
 
+      // Akıllı giriş/SL/TP (dönüş seviyelerine göre)
+      const price = coin.price;
+      const lv = calcEntryLevels(sig, price, CONFIG.scalpTF);
+
+      // ULAŞILABİLİRLİK: giriş bölgesi fiyata çok uzaksa sinyal verme
+      // (örn fiyat $1, giriş $2 → fiyat oraya gelmeyebilir)
+      if (!lv.reachable) { unreachable++; continue; }
+
       alarmHistory[key] = now;
       found++;
-
-      // Calculate entry/SL/TP
-      const price = coin.price;
-      const atr = sig.atr || price * 0.005;
-      const slPctMax = { '1m': 0.005, '5m': 0.008, '15m': 0.012 }[CONFIG.scalpTF] || 0.008;
-      const slDist = Math.min(atr * 0.8, price * slPctMax);
-      const entry = price;
-      const sl  = sig.dir === 'LONG' ? entry - slDist : entry + slDist;
-      const tp1 = sig.dir === 'LONG' ? entry + slDist * 1 : entry - slDist * 1;
-      const tp2 = sig.dir === 'LONG' ? entry + slDist * 2 : entry - slDist * 2;
-      const tp3 = sig.dir === 'LONG' ? entry + slDist * 3.5 : entry - slDist * 3.5;
 
       const dec = price > 100 ? 2 : price > 1 ? 4 : 6;
       const f = v => v.toLocaleString('tr-TR', { minimumFractionDigits: dec, maximumFractionDigits: dec });
       const emoji = sig.dir === 'LONG' ? '🟢⬆️' : '🔴⬇️';
+      const zoneLabel = sig.dir === 'LONG' ? 'Destek bölgesinden LONG' : 'Direnç bölgesinden SHORT';
       const btNote = bt && bt.total > 0 ? `\n📊 Backtest: %${bt.winRate} kazanma (${bt.total} işlem, P/L: ${bt.profitable ? '+' : ''}${bt.totalPnl}%)` : '';
 
       const msg =
 `${emoji} <b>${sig.dir} SİNYALİ — ${coin.sym}</b>
+🎯 ${zoneLabel}
 
-💰 Fiyat: <b>$${f(price)}</b>
+💰 Anlık fiyat: <b>$${f(price)}</b>
 🎯 Güven: <b>%${sig.confidence}</b>
 ⏱️ Zaman dilimi: ${CONFIG.scalpTF}
 📈 24s değişim: ${coin.chg24 >= 0 ? '+' : ''}${coin.chg24.toFixed(2)}%
 
-<b>Giriş Seviyeleri:</b>
-▫️ Giriş: $${f(entry)}
-🛑 SL: $${f(sl)} (${(slDist / entry * 100).toFixed(2)}%)
-✅ TP1: $${f(tp1)}
-✅ TP2: $${f(tp2)}
-✅ TP3: $${f(tp3)}
+<b>📍 Giriş Bölgesi (limit emir koy):</b>
+$${f(lv.entryZoneLow)} — $${f(lv.entryZoneHigh)}
+▫️ İdeal giriş: $${f(lv.entry)}
+🛑 SL: $${f(lv.sl)} (${lv.slPct.toFixed(2)}%)
+✅ TP1: $${f(lv.tp1)}
+✅ TP2: $${f(lv.tp2)}
+✅ TP3: $${f(lv.tp3)}
 
 <b>Sinyaller:</b>
-${sig.signals.slice(0, 4).map(s => '• ' + s).join('\n')}${btNote}
+${sig.signals.slice(0, 5).map(s => '• ' + s).join('\n')}${btNote}
 
-⚠️ <i>Yatırım tavsiyesi değildir. Kendi riskinle işlem yap.</i>`;
+${lv.inZone ? '🟢 <i>Fiyat şu an giriş bölgesinde - hemen girilebilir.</i>' : `🟡 <i>Fiyat giriş bölgesine ${lv.distToZone.toFixed(2)}% uzakta. Limit emir koy, fiyat gelince otomatik girer.</i>`}
+💡 <i>SL ${sig.dir === 'LONG' ? 'desteğin altında' : 'direncin üstünde'} - kolay vurmaz.</i>
+⚠️ <i>Yatırım tavsiyesi değildir.</i>`;
 
       await sendTelegram(msg);
       console.log(new Date().toLocaleTimeString('tr-TR'), `- ✅ Sinyal gönderildi: ${coin.sym} ${sig.dir} %${sig.confidence}`);
@@ -577,7 +766,7 @@ ${sig.signals.slice(0, 4).map(s => '• ' + s).join('\n')}${btNote}
   // Detaylı teşhis logu
   console.log(new Date().toLocaleTimeString('tr-TR'),
     `- ✅ Tarama bitti | Tarandı: ${scanned} | Sinyal: ${found} | ` +
-    `Düşük güven: ${lowConf} | Backtest eledi: ${btFail} | Tekrar engeli: ${deduped} | Veri yok: ${noData}`);
+    `Düşük güven: ${lowConf} | Backtest: ${btFail} | Uzak giriş: ${unreachable} | Tekrar: ${deduped} | Veri yok: ${noData}`);
   if (found === 0 && bestSeen.sym) {
     console.log(`   ℹ️ En yüksek güven: ${bestSeen.sym} ${bestSeen.dir||''} %${bestSeen.conf} (eşik %${CONFIG.minConfidence}). Uygun fırsat bulunamadı, bu normal.`);
   }
@@ -694,15 +883,10 @@ async function smartAnalyze(symbol) {
   if (aligned) finalConf = Math.min(100, Math.round(finalConf * 0.6 + bias.aligned * 100 * 0.4));
   else finalConf = Math.round(finalConf * 0.5); // ters trendde güveni düşür
 
-  // Entry/SL/TP
-  const atr = sig.atr || price * 0.005;
-  const slPctMax = { '1m':0.005,'5m':0.008,'15m':0.012 }[scalpTF] || 0.008;
-  const slDist = Math.min(atr * 0.8, price * slPctMax);
-  const entry = price;
-  const sl  = sig.dir === 'LONG' ? entry - slDist : entry + slDist;
-  const tp1 = sig.dir === 'LONG' ? entry + slDist : entry - slDist;
-  const tp2 = sig.dir === 'LONG' ? entry + slDist*2 : entry - slDist*2;
-  const tp3 = sig.dir === 'LONG' ? entry + slDist*3.5 : entry - slDist*3.5;
+  // Akıllı giriş/SL/TP (dönüş seviyelerine göre)
+  const lv = calcEntryLevels(sig, price, scalpTF);
+  const entry = lv.entry, sl = lv.sl, tp1 = lv.tp1, tp2 = lv.tp2, tp3 = lv.tp3;
+  const slDist = lv.slDist;
 
   const dirEmoji = sig.dir === 'LONG' ? '🟢⬆️' : '🔴⬇️';
   const confEmoji = finalConf >= 75 ? '🔥' : finalConf >= 60 ? '✅' : '⚠️';
@@ -739,9 +923,11 @@ ${trendSummary}
 Genel eğilim: <b>${bias.dominantBias}</b> (%${bias.bullPct} boğa)
 ${alignWarn}
 
-<b>Giriş Seviyeleri (${sig.dir} · ${scalpTF}):</b>
-▫️ Giriş: $${f(entry)}
-🛑 SL: $${f(sl)} (${(slDist/entry*100).toFixed(2)}%)
+<b>📍 Giriş Bölgesi (${sig.dir === 'LONG' ? 'destekten' : 'dirençten'} · ${scalpTF}):</b>
+$${f(lv.entryZoneLow)} — $${f(lv.entryZoneHigh)}
+▫️ İdeal giriş: $${f(entry)}
+${lv.inZone ? '🟢 <b>Fiyat şu an giriş bölgesinde - işleme girilebilir</b>' : lv.reachable ? `🟡 Fiyat giriş bölgesine ${lv.distToZone.toFixed(2)}% uzakta - bekle, gelince gir` : `🔴 <b>Fiyat giriş bölgesine ${lv.distToZone.toFixed(2)}% uzak - bu seviyeye gelmeyebilir, riskli</b>`}
+🛑 SL: $${f(sl)} (${lv.slPct.toFixed(2)}%)
 ✅ TP1: $${f(tp1)}
 ✅ TP2: $${f(tp2)}
 ✅ TP3: $${f(tp3)}
@@ -776,15 +962,10 @@ async function analyzeCoinForCommand(symbol, tf) {
   const dec = price > 100 ? 2 : price > 1 ? 4 : 6;
   const f = v => v.toLocaleString('tr-TR', { minimumFractionDigits: dec, maximumFractionDigits: dec });
 
-  // Entry/SL/TP hesapla
-  const atr = sig.atr || price * 0.005;
-  const slPctMax = { '1m':0.005,'3m':0.006,'5m':0.008,'15m':0.012,'30m':0.018,'1h':0.025,'2h':0.035,'4h':0.05,'1d':0.08,'1w':0.15 }[tf] || 0.01;
-  const slDist = Math.min(atr * 0.8, price * slPctMax);
-  const entry = price;
-  const sl  = sig.dir === 'LONG' ? entry - slDist : entry + slDist;
-  const tp1 = sig.dir === 'LONG' ? entry + slDist * 1 : entry - slDist * 1;
-  const tp2 = sig.dir === 'LONG' ? entry + slDist * 2 : entry - slDist * 2;
-  const tp3 = sig.dir === 'LONG' ? entry + slDist * 3.5 : entry - slDist * 3.5;
+  // Akıllı giriş/SL/TP (dönüş seviyelerine göre)
+  const lv = calcEntryLevels(sig, price, tf);
+  const entry = lv.entry, sl = lv.sl, tp1 = lv.tp1, tp2 = lv.tp2, tp3 = lv.tp3;
+  const slDist = lv.slDist;
 
   const dirEmoji = sig.dir === 'LONG' ? '🟢⬆️' : '🔴⬇️';
   const confEmoji = sig.confidence >= 75 ? '🔥' : sig.confidence >= 60 ? '✅' : '⚠️';
@@ -811,9 +992,11 @@ async function analyzeCoinForCommand(symbol, tf) {
 🎯 Güven: <b>%${sig.confidence}</b>
 ${recommendation}
 
-<b>Giriş Seviyeleri (${sig.dir}):</b>
-▫️ Giriş: $${f(entry)}
-🛑 SL: $${f(sl)} (${(slDist / entry * 100).toFixed(2)}%)
+<b>📍 Giriş Bölgesi (${sig.dir === 'LONG' ? 'destekten' : 'dirençten'}):</b>
+$${f(lv.entryZoneLow)} — $${f(lv.entryZoneHigh)}
+▫️ İdeal giriş: $${f(entry)}
+${lv.inZone ? '🟢 <b>Fiyat şu an giriş bölgesinde - işleme girilebilir</b>' : lv.reachable ? `🟡 Fiyat giriş bölgesine ${lv.distToZone.toFixed(2)}% uzakta - bekle, gelince gir` : `🔴 <b>Fiyat giriş bölgesine ${lv.distToZone.toFixed(2)}% uzak - bu seviyeye gelmeyebilir, riskli</b>`}
+🛑 SL: $${f(sl)} (${lv.slPct.toFixed(2)}%)
 ✅ TP1: $${f(tp1)}
 ✅ TP2: $${f(tp2)}
 ✅ TP3: $${f(tp3)}
