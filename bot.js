@@ -235,25 +235,193 @@ function backtestScalp(bars, tfId) {
 // ================================================================
 
 // Bybit kline (OHLC) - en güvenilir CORS-free kaynak
+// ================================================================
+// SEMBOL KAYDI - tüm borsalardaki coinleri başlangıçta yükle
+// Kullanıcı "PEPE" yazınca borsadaki gerçek sembolü ("1000PEPEUSDT") bulur
+// ================================================================
+const SYMBOL_REGISTRY = {
+  binance: {},  // { PEPE: "1000PEPEUSDT", BTC: "BTCUSDT", ... }
+  bybit:   {},
+  okx:     {},
+};
+let registryLoaded = false;
+
+async function loadSymbolRegistry() {
+  console.log('📡 Borsa sembol listeleri yükleniyor...');
+
+  // ── Binance Futures sembolleri ──
+  try {
+    const r = await fetch('https://fapi.binance.com/fapi/v1/exchangeInfo');
+    if (r.ok) {
+      const d = await r.json();
+      (d.symbols || []).forEach(s => {
+        if (s.quoteAsset === 'USDT' && s.status === 'TRADING' && s.contractType === 'PERPETUAL') {
+          // baseAsset normalize: "1000PEPE" → anahtar hem "1000PEPE" hem "PEPE"
+          const base = s.baseAsset.toUpperCase();
+          SYMBOL_REGISTRY.binance[base] = s.symbol;
+          // 1000/1M ön ekini temizleyip de kaydet (PEPE → 1000PEPEUSDT)
+          const clean = base.replace(/^1000+/, '').replace(/^1M/, '');
+          if (clean !== base && !SYMBOL_REGISTRY.binance[clean]) {
+            SYMBOL_REGISTRY.binance[clean] = s.symbol;
+          }
+        }
+      });
+      console.log(`  ✓ Binance: ${Object.keys(SYMBOL_REGISTRY.binance).length} coin`);
+    }
+  } catch (e) { console.log('  ✗ Binance sembol hatası:', e.message); }
+
+  // ── Bybit sembolleri ──
+  try {
+    const r = await fetch('https://api.bybit.com/v5/market/instruments-info?category=linear');
+    if (r.ok) {
+      const d = await r.json();
+      (d.result?.list || []).forEach(s => {
+        if (s.quoteCoin === 'USDT' && s.status === 'Trading') {
+          const base = s.baseCoin.toUpperCase();
+          SYMBOL_REGISTRY.bybit[base] = s.symbol;
+          const clean = base.replace(/^1000+/, '').replace(/^1M/, '');
+          if (clean !== base && !SYMBOL_REGISTRY.bybit[clean]) {
+            SYMBOL_REGISTRY.bybit[clean] = s.symbol;
+          }
+        }
+      });
+      console.log(`  ✓ Bybit: ${Object.keys(SYMBOL_REGISTRY.bybit).length} coin`);
+    }
+  } catch (e) { console.log('  ✗ Bybit sembol hatası:', e.message); }
+
+  // ── OKX sembolleri ──
+  try {
+    const r = await fetch('https://www.okx.com/api/v5/public/instruments?instType=SWAP');
+    if (r.ok) {
+      const d = await r.json();
+      (d.data || []).forEach(s => {
+        if (s.settleCcy === 'USDT' && s.state === 'live') {
+          const base = s.ctValCcy.toUpperCase();
+          SYMBOL_REGISTRY.okx[base] = s.instId;
+        }
+      });
+      console.log(`  ✓ OKX: ${Object.keys(SYMBOL_REGISTRY.okx).length} coin`);
+    }
+  } catch (e) { console.log('  ✗ OKX sembol hatası:', e.message); }
+
+  registryLoaded = true;
+  const total = new Set([
+    ...Object.keys(SYMBOL_REGISTRY.binance),
+    ...Object.keys(SYMBOL_REGISTRY.bybit),
+    ...Object.keys(SYMBOL_REGISTRY.okx),
+  ]).size;
+  console.log(`✅ Toplam ${total} farklı coin yüklendi`);
+}
+
+// Bir coin hangi borsalarda var, listele
+function findCoinExchanges(sym) {
+  const s = sym.toUpperCase();
+  const found = [];
+  if (SYMBOL_REGISTRY.binance[s]) found.push('Binance');
+  if (SYMBOL_REGISTRY.bybit[s])   found.push('Bybit');
+  if (SYMBOL_REGISTRY.okx[s])     found.push('OKX');
+  return found;
+}
+
 async function fetchOHLC(sym, tf) {
-  const interval = { '1m': '1', '5m': '5', '15m': '15', '1h': '60' }[tf] || '5';
+  const s = sym.toUpperCase();
+  // Registry'den gerçek sembolü bul, yoksa varsayılan dene
+  const bnSym = SYMBOL_REGISTRY.binance[s];
+  const bySym = SYMBOL_REGISTRY.bybit[s];
+  const okSym = SYMBOL_REGISTRY.okx[s];
+
+  // Registry doluysa gerçek sembolü kullan, boşsa eski yöntemle dene
+  const bars = (bnSym && await fetchBinanceRaw(bnSym, tf))
+            || (bySym && await fetchBybitRaw(bySym, tf))
+            || (okSym && await fetchOKXRaw(okSym, tf))
+            || await fetchBinance(s, tf)   // fallback: direkt dene
+            || await fetchBybit(s, tf)
+            || await fetchOKX(s, tf);
+  return bars;
+}
+
+// Gerçek sembol ile direkt çekim (registry'den gelen tam sembol adı)
+async function fetchBinanceRaw(fullSym, tf) {
+  const interval = { '1m':'1m','3m':'3m','5m':'5m','15m':'15m','30m':'30m','1h':'1h','2h':'2h','4h':'4h','1d':'1d','1w':'1w' }[tf] || '5m';
+  const url = `https://fapi.binance.com/fapi/v1/klines?symbol=${fullSym}&interval=${interval}&limit=200`;
+  try {
+    const r = await fetch(url);
+    if (!r.ok) return null;
+    const d = await r.json();
+    if (!Array.isArray(d) || d.length < 10) return null;
+    return d.map(k => ({ t:k[0], o:parseFloat(k[1]), h:parseFloat(k[2]), l:parseFloat(k[3]), c:parseFloat(k[4]), vol:parseFloat(k[5]) }));
+  } catch (e) { return null; }
+}
+async function fetchBybitRaw(fullSym, tf) {
+  const interval = { '1m':'1','3m':'3','5m':'5','15m':'15','30m':'30','1h':'60','2h':'120','4h':'240','1d':'D','1w':'W' }[tf] || '5';
+  const url = `https://api.bybit.com/v5/market/kline?category=linear&symbol=${fullSym}&interval=${interval}&limit=200`;
+  try {
+    const r = await fetch(url);
+    if (!r.ok) return null;
+    const d = await r.json();
+    if (d.retCode !== 0 || !d.result?.list || d.result.list.length < 10) return null;
+    return d.result.list.reverse().map(k => ({ t:parseInt(k[0]), o:parseFloat(k[1]), h:parseFloat(k[2]), l:parseFloat(k[3]), c:parseFloat(k[4]), vol:parseFloat(k[5]) }));
+  } catch (e) { return null; }
+}
+async function fetchOKXRaw(fullSym, tf) {
+  const bar = { '1m':'1m','3m':'3m','5m':'5m','15m':'15m','30m':'30m','1h':'1H','2h':'2H','4h':'4H','1d':'1D','1w':'1W' }[tf] || '5m';
+  const url = `https://www.okx.com/api/v5/market/candles?instId=${fullSym}&bar=${bar}&limit=200`;
+  try {
+    const r = await fetch(url);
+    if (!r.ok) return null;
+    const d = await r.json();
+    if (d.code !== '0' || !d.data || d.data.length < 10) return null;
+    return d.data.reverse().map(k => ({ t:parseInt(k[0]), o:parseFloat(k[1]), h:parseFloat(k[2]), l:parseFloat(k[3]), c:parseFloat(k[4]), vol:parseFloat(k[5]) }));
+  } catch (e) { return null; }
+}
+
+// ── Binance Futures kline ──
+async function fetchBinance(sym, tf) {
+  const interval = { '1m':'1m','3m':'3m','5m':'5m','15m':'15m','30m':'30m','1h':'1h','2h':'2h','4h':'4h','1d':'1d','1w':'1w' }[tf] || '5m';
+  const url = `https://fapi.binance.com/fapi/v1/klines?symbol=${sym}USDT&interval=${interval}&limit=200`;
+  try {
+    const r = await fetch(url);
+    if (!r.ok) return null;
+    const d = await r.json();
+    if (!Array.isArray(d) || d.length < 10) return null;
+    return d.map(k => ({
+      t: k[0], o: parseFloat(k[1]), h: parseFloat(k[2]),
+      l: parseFloat(k[3]), c: parseFloat(k[4]), vol: parseFloat(k[5]),
+    }));
+  } catch (e) { return null; }
+}
+
+// ── Bybit kline ──
+async function fetchBybit(sym, tf) {
+  const interval = { '1m':'1','3m':'3','5m':'5','15m':'15','30m':'30','1h':'60','2h':'120','4h':'240','1d':'D','1w':'W' }[tf] || '5';
   const url = `https://api.bybit.com/v5/market/kline?category=linear&symbol=${sym}USDT&interval=${interval}&limit=200`;
   try {
     const r = await fetch(url);
+    if (!r.ok) return null;
     const d = await r.json();
-    if (d.retCode !== 0 || !d.result?.list) return null;
-    // Bybit returns newest first - reverse to oldest first
+    if (d.retCode !== 0 || !d.result?.list || d.result.list.length < 10) return null;
     return d.result.list.reverse().map(k => ({
-      t: parseInt(k[0]),
-      o: parseFloat(k[1]),
-      h: parseFloat(k[2]),
-      l: parseFloat(k[3]),
-      c: parseFloat(k[4]),
-      vol: parseFloat(k[5]),
+      t: parseInt(k[0]), o: parseFloat(k[1]), h: parseFloat(k[2]),
+      l: parseFloat(k[3]), c: parseFloat(k[4]), vol: parseFloat(k[5]),
     }));
-  } catch (e) {
-    return null;
-  }
+  } catch (e) { return null; }
+}
+
+// ── OKX kline ──
+async function fetchOKX(sym, tf) {
+  const bar = { '1m':'1m','3m':'3m','5m':'5m','15m':'15m','30m':'30m','1h':'1H','2h':'2H','4h':'4H','1d':'1D','1w':'1W' }[tf] || '5m';
+  const url = `https://www.okx.com/api/v5/market/candles?instId=${sym}-USDT-SWAP&bar=${bar}&limit=200`;
+  try {
+    const r = await fetch(url);
+    if (!r.ok) return null;
+    const d = await r.json();
+    if (d.code !== '0' || !d.data || d.data.length < 10) return null;
+    // OKX returns newest first - reverse
+    return d.data.reverse().map(k => ({
+      t: parseInt(k[0]), o: parseFloat(k[1]), h: parseFloat(k[2]),
+      l: parseFloat(k[3]), c: parseFloat(k[4]), vol: parseFloat(k[5]),
+    }));
+  } catch (e) { return null; }
 }
 
 // Top coins by volume from CoinGecko
@@ -396,7 +564,11 @@ async function analyzeCoinForCommand(symbol, tf) {
 
   const bars = await fetchOHLC(sym, tf);
   if (!bars || bars.length < 30) {
-    return `❌ <b>${sym}</b> için veri bulunamadı.\n\nDoğru coin ismi yazdığından emin ol (örn: BTC, ETH, SOL, PEPE).`;
+    return `❌ <b>${sym}</b> için veri bulunamadı.\n\n` +
+      `Bu coin Binance/Bybit/OKX vadeli işlemlerinde bulunamadı.\n\n` +
+      `• Coin ismini kontrol et (örn: BTC, ETH, SOL, DOGE, PEPE)\n` +
+      `• USDT ekleme, sadece coin yaz\n` +
+      `• Çok yeni/küçük coinler olmayabilir`;
   }
 
   const price = bars[bars.length - 1].c;
@@ -410,7 +582,7 @@ async function analyzeCoinForCommand(symbol, tf) {
 
   // Entry/SL/TP hesapla
   const atr = sig.atr || price * 0.005;
-  const slPctMax = { '1m': 0.005, '5m': 0.008, '15m': 0.012 }[tf] || 0.008;
+  const slPctMax = { '1m':0.005,'3m':0.006,'5m':0.008,'15m':0.012,'30m':0.018,'1h':0.025,'2h':0.035,'4h':0.05,'1d':0.08,'1w':0.15 }[tf] || 0.01;
   const slDist = Math.min(atr * 0.8, price * slPctMax);
   const entry = price;
   const sl  = sig.dir === 'LONG' ? entry - slDist : entry + slDist;
@@ -421,6 +593,8 @@ async function analyzeCoinForCommand(symbol, tf) {
   const dirEmoji = sig.dir === 'LONG' ? '🟢⬆️' : '🔴⬇️';
   const confEmoji = sig.confidence >= 75 ? '🔥' : sig.confidence >= 60 ? '✅' : '⚠️';
   const flow = sig.orderFlow;
+  const exchanges = findCoinExchanges(sym);
+  const exNote = exchanges.length ? exchanges.join(', ') : 'Bilinmiyor';
 
   const btNote = bt && bt.total > 0
     ? `\n📊 <b>Backtest:</b> %${bt.winRate} kazanma (${bt.total} işlem, P/L: ${bt.profitable ? '+' : ''}${bt.totalPnl}%)`
@@ -452,6 +626,7 @@ ${recommendation}
 ${sig.signals.length ? sig.signals.slice(0, 5).map(s => '• ' + s).join('\n') : '• Net sinyal yok'}
 ${flow ? `\n<b>Order Flow:</b> Alım %${flow.buyPct.toFixed(0)} / Satım %${flow.sellPct.toFixed(0)}` : ''}
 📈 RSI: ${sig.rsiNow ? sig.rsiNow.toFixed(1) : '--'}${btNote}
+🏦 Borsalar: ${exNote}
 
 ⚠️ <i>Yatırım tavsiyesi değildir.</i>`;
 }
@@ -473,6 +648,24 @@ async function pollCommands() {
       const chatId = msg.chat.id;
       const text = msg.text.trim();
 
+      // /coins komutu - kaç coin var
+      if (text === '/coins') {
+        const total = new Set([
+          ...Object.keys(SYMBOL_REGISTRY.binance),
+          ...Object.keys(SYMBOL_REGISTRY.bybit),
+          ...Object.keys(SYMBOL_REGISTRY.okx),
+        ]).size;
+        await sendTelegramTo(chatId,
+          `🏦 <b>Mevcut Coin Sayısı</b>\n\n` +
+          `• Binance: ${Object.keys(SYMBOL_REGISTRY.binance).length}\n` +
+          `• Bybit: ${Object.keys(SYMBOL_REGISTRY.bybit).length}\n` +
+          `• OKX: ${Object.keys(SYMBOL_REGISTRY.okx).length}\n\n` +
+          `📊 Toplam <b>${total}</b> farklı coin analiz edilebilir.\n\n` +
+          `Herhangi birinin ismini yaz, analiz edeyim!`
+        );
+        continue;
+      }
+
       // /start veya /help komutu
       if (text === '/start' || text === '/help') {
         await sendTelegramTo(chatId,
@@ -481,9 +674,11 @@ async function pollCommands() {
           'Sadece coin ismini yaz, örn:\n' +
           '<code>BTC</code> veya <code>ETH</code> veya <code>SOL</code>\n\n' +
           '⏱️ <b>Zaman dilimi seçmek için:</b>\n' +
-          '<code>BTC 1m</code> (1 dakika)\n' +
-          '<code>BTC 5m</code> (5 dakika)\n' +
-          '<code>BTC 15m</code> (15 dakika)\n\n' +
+          '<code>BTC 5m</code> — tek zaman dilimi\n' +
+          '<code>BTC 5m 1h 4h</code> — birden fazla (max 5)\n\n' +
+          '<b>Kullanılabilir zaman dilimleri:</b>\n' +
+          '1m, 3m, 5m, 15m, 30m, 1h, 2h, 4h, 1d, 1w\n\n' +
+          '📋 <code>/coins</code> — kaç coin var gör\n\n' +
           '🔔 Otomatik sinyaller %' + CONFIG.minConfidence + '+ güvende gelir.\n\n' +
           'Hadi bir coin yaz, analiz edeyim! 🚀'
         );
@@ -493,24 +688,33 @@ async function pollCommands() {
       // Komut mesajlarını atla (/ ile başlayan diğerleri)
       if (text.startsWith('/')) continue;
 
-      // Coin + opsiyonel TF parse et (örn "BTC 5m" veya "btc")
+      // Coin + opsiyonel TF(ler) parse et
+      // Örnekler: "BTC" / "BTC 5m" / "BTC 5m 1h 4h" / "ETH 1d"
+      const VALID_TFS = ['1m','3m','5m','15m','30m','1h','2h','4h','1d','1w'];
       const parts = text.split(/\s+/);
       const coinSym = parts[0];
-      const tf = parts[1] && ['1m','5m','15m','1h'].includes(parts[1]) ? parts[1] : CONFIG.scalpTF;
 
-      // Geçerli coin ismi mi (harf, max 12 karakter)
-      if (!/^[A-Za-z0-9]{2,12}$/.test(coinSym)) {
+      // Geçerli coin ismi mi
+      if (!/^[A-Za-z0-9]{2,15}$/.test(coinSym)) {
         await sendTelegramTo(chatId, '❓ Geçerli bir coin ismi yaz (örn: <code>BTC</code>, <code>ETH</code>, <code>SOL</code>).\n\nKomutlar için /help yaz.');
         continue;
       }
 
-      // "Analiz ediliyor" mesajı
-      await sendTelegramTo(chatId, `⏳ <b>${coinSym.toUpperCase()}</b> analiz ediliyor (${tf})...`);
+      // Yazılan TF'leri topla (birden fazla olabilir)
+      let tfs = parts.slice(1).filter(p => VALID_TFS.includes(p.toLowerCase())).map(p => p.toLowerCase());
+      if (tfs.length === 0) tfs = [CONFIG.scalpTF]; // hiç yazılmadıysa varsayılan
+      if (tfs.length > 5) tfs = tfs.slice(0, 5); // max 5 TF
 
-      // Analiz yap ve gönder
-      const analysis = await analyzeCoinForCommand(coinSym, tf);
-      await sendTelegramTo(chatId, analysis);
-      console.log(new Date().toLocaleTimeString('tr-TR'), `- Komut: ${coinSym} ${tf} → ${chatId}`);
+      // "Analiz ediliyor" mesajı
+      await sendTelegramTo(chatId, `⏳ <b>${coinSym.toUpperCase()}</b> analiz ediliyor (${tfs.join(', ')})...`);
+
+      // Her TF için analiz yap ve gönder
+      for (const tf of tfs) {
+        const analysis = await analyzeCoinForCommand(coinSym, tf);
+        await sendTelegramTo(chatId, analysis);
+        await new Promise(r => setTimeout(r, 400)); // mesajlar arası kısa bekleme
+      }
+      console.log(new Date().toLocaleTimeString('tr-TR'), `- Komut: ${coinSym} [${tfs.join(',')}] → ${chatId}`);
     }
   } catch (e) {
     console.error('Poll error:', e.message);
@@ -542,6 +746,9 @@ async function start() {
     process.exit(1);
   }
   console.log('✅ Telegram bağlantısı başarılı!');
+
+  // Borsa sembollerini yükle (tüm coinler)
+  await loadSymbolRegistry();
 
   // First scan immediately
   await scanForSignals();
