@@ -249,43 +249,59 @@ let registryLoaded = false;
 async function loadSymbolRegistry() {
   console.log('📡 Borsa sembol listeleri yükleniyor...');
 
-  // ── Binance Futures sembolleri ──
-  try {
-    const r = await fetch('https://fapi.binance.com/fapi/v1/exchangeInfo');
-    if (r.ok) {
+  // ── Binance Futures sembolleri (birden fazla domain dener) ──
+  const binanceDomains = [
+    'https://fapi.binance.com/fapi/v1/exchangeInfo',
+    'https://www.binance.com/fapi/v1/exchangeInfo',
+    'https://fapi1.binance.com/fapi/v1/exchangeInfo',
+  ];
+  for (const url of binanceDomains) {
+    try {
+      const r = await fetch(url);
+      if (!r.ok) { console.log(`  ⚠ Binance ${url.split('/')[2]}: HTTP ${r.status}`); continue; }
       const d = await r.json();
       (d.symbols || []).forEach(s => {
         if (s.quoteAsset === 'USDT' && s.status === 'TRADING' && s.contractType === 'PERPETUAL') {
-          // baseAsset normalize: "1000PEPE" → anahtar hem "1000PEPE" hem "PEPE"
           const base = s.baseAsset.toUpperCase();
           SYMBOL_REGISTRY.binance[base] = s.symbol;
-          // 1000/1M ön ekini temizleyip de kaydet (PEPE → 1000PEPEUSDT)
           const clean = base.replace(/^1000+/, '').replace(/^1M/, '');
           if (clean !== base && !SYMBOL_REGISTRY.binance[clean]) {
             SYMBOL_REGISTRY.binance[clean] = s.symbol;
           }
         }
       });
-      console.log(`  ✓ Binance: ${Object.keys(SYMBOL_REGISTRY.binance).length} coin`);
-    }
-  } catch (e) { console.log('  ✗ Binance sembol hatası:', e.message); }
+      if (Object.keys(SYMBOL_REGISTRY.binance).length > 0) {
+        console.log(`  ✓ Binance: ${Object.keys(SYMBOL_REGISTRY.binance).length} coin`);
+        break; // başarılı, diğer domainleri deneme
+      }
+    } catch (e) { console.log(`  ✗ Binance ${url.split('/')[2]} hatası:`, e.message); }
+  }
+  if (Object.keys(SYMBOL_REGISTRY.binance).length === 0) {
+    console.log('  ✗ Binance: hiç coin yüklenemedi (coğrafi engel olabilir)');
+  }
 
   // ── Bybit sembolleri ──
   try {
-    const r = await fetch('https://api.bybit.com/v5/market/instruments-info?category=linear');
-    if (r.ok) {
+    const r = await fetch('https://api.bybit.com/v5/market/instruments-info?category=linear&limit=1000');
+    if (!r.ok) {
+      console.log(`  ⚠ Bybit: HTTP ${r.status}`);
+    } else {
       const d = await r.json();
-      (d.result?.list || []).forEach(s => {
-        if (s.quoteCoin === 'USDT' && s.status === 'Trading') {
-          const base = s.baseCoin.toUpperCase();
-          SYMBOL_REGISTRY.bybit[base] = s.symbol;
-          const clean = base.replace(/^1000+/, '').replace(/^1M/, '');
-          if (clean !== base && !SYMBOL_REGISTRY.bybit[clean]) {
-            SYMBOL_REGISTRY.bybit[clean] = s.symbol;
+      if (d.retCode !== 0) {
+        console.log(`  ⚠ Bybit retCode: ${d.retCode} ${d.retMsg}`);
+      } else {
+        (d.result?.list || []).forEach(s => {
+          if (s.quoteCoin === 'USDT' && s.status === 'Trading') {
+            const base = s.baseCoin.toUpperCase();
+            SYMBOL_REGISTRY.bybit[base] = s.symbol;
+            const clean = base.replace(/^1000+/, '').replace(/^1M/, '');
+            if (clean !== base && !SYMBOL_REGISTRY.bybit[clean]) {
+              SYMBOL_REGISTRY.bybit[clean] = s.symbol;
+            }
           }
-        }
-      });
-      console.log(`  ✓ Bybit: ${Object.keys(SYMBOL_REGISTRY.bybit).length} coin`);
+        });
+        console.log(`  ✓ Bybit: ${Object.keys(SYMBOL_REGISTRY.bybit).length} coin`);
+      }
     }
   } catch (e) { console.log('  ✗ Bybit sembol hatası:', e.message); }
 
@@ -317,26 +333,25 @@ async function loadSymbolRegistry() {
 function findCoinExchanges(sym) {
   const s = sym.toUpperCase();
   const found = [];
+  if (SYMBOL_REGISTRY.okx[s])     found.push('OKX');
   if (SYMBOL_REGISTRY.binance[s]) found.push('Binance');
   if (SYMBOL_REGISTRY.bybit[s])   found.push('Bybit');
-  if (SYMBOL_REGISTRY.okx[s])     found.push('OKX');
   return found;
 }
 
 async function fetchOHLC(sym, tf) {
   const s = sym.toUpperCase();
-  // Registry'den gerçek sembolü bul, yoksa varsayılan dene
+  // OKX öncelikli (Railway US West'te Binance/Bybit engelli)
+  const okSym = SYMBOL_REGISTRY.okx[s];
   const bnSym = SYMBOL_REGISTRY.binance[s];
   const bySym = SYMBOL_REGISTRY.bybit[s];
-  const okSym = SYMBOL_REGISTRY.okx[s];
 
-  // Registry doluysa gerçek sembolü kullan, boşsa eski yöntemle dene
-  const bars = (bnSym && await fetchBinanceRaw(bnSym, tf))
+  const bars = (okSym && await fetchOKXRaw(okSym, tf))
+            || await fetchOKX(s, tf)
+            || (bnSym && await fetchBinanceRaw(bnSym, tf))
             || (bySym && await fetchBybitRaw(bySym, tf))
-            || (okSym && await fetchOKXRaw(okSym, tf))
-            || await fetchBinance(s, tf)   // fallback: direkt dene
-            || await fetchBybit(s, tf)
-            || await fetchOKX(s, tf);
+            || await fetchBinance(s, tf)
+            || await fetchBybit(s, tf);
   return bars;
 }
 
@@ -558,6 +573,155 @@ async function sendTelegramTo(chatId, text) {
 }
 
 // Bir coin için tam analiz mesajı oluştur
+// ── Üst zaman dilimi trend analizi (HTF bias) ──
+async function getMultiTFBias(sym) {
+  const tfsToCheck = ['15m', '1h', '4h', '1d'];
+  const trends = {};
+  let bullScore = 0, bearScore = 0;
+  // Üst TF'ler daha ağırlıklı
+  const weights = { '15m': 1, '1h': 2, '4h': 3, '1d': 4 };
+
+  for (const tf of tfsToCheck) {
+    const bars = await fetchOHLC(sym, tf);
+    if (!bars || bars.length < 22) { trends[tf] = null; continue; }
+    const ribbon = calcEMARibbon(bars);
+    const sig = calcScalpSignal(bars, bars[bars.length-1].c);
+    const dir = sig ? sig.dir : (ribbon && ribbon.trend.includes('YUKSELIS') ? 'LONG' : 'SHORT');
+    trends[tf] = { dir, trend: ribbon ? ribbon.trend : '--', conf: sig ? sig.confidence : 0 };
+    const w = weights[tf] || 1;
+    if (dir === 'LONG') bullScore += w; else bearScore += w;
+  }
+
+  const totalW = Object.values(weights).reduce((a,b)=>a+b,0);
+  const bullPct = Math.round(bullScore / totalW * 100);
+  const dominantBias = bullScore >= bearScore ? 'LONG' : 'SHORT';
+  // Uyum: kaç TF aynı yönde
+  const aligned = Math.max(bullScore, bearScore) / totalW;
+
+  return { trends, dominantBias, bullPct, bearPct: 100-bullPct, aligned };
+}
+
+// ── En uygun scalp TF'sini seç (volatiliteye göre) ──
+async function pickBestScalpTF(sym) {
+  // Scalp için 1m, 5m, 15m arasından en uygununu seç
+  const candidates = ['1m', '5m', '15m'];
+  let best = '5m', bestScore = -1;
+  const atrInfo = {};
+
+  for (const tf of candidates) {
+    const bars = await fetchOHLC(sym, tf);
+    if (!bars || bars.length < 15) { atrInfo[tf] = 0; continue; }
+    const price = bars[bars.length-1].c;
+    const atr = calcATR(bars, 14);
+    const atrPct = atr ? (atr / price * 100) : 0;
+    atrInfo[tf] = atrPct;
+
+    // İdeal scalp ATR aralıkları (skor ver)
+    let score = 0;
+    if (tf === '1m')  score = (atrPct >= 0.1 && atrPct <= 0.4) ? 3 : atrPct > 0.4 ? 2 : 1;
+    if (tf === '5m')  score = (atrPct >= 0.3 && atrPct <= 0.9) ? 3 : atrPct > 0.9 ? 2 : 1;
+    if (tf === '15m') score = (atrPct >= 0.6 && atrPct <= 1.6) ? 3 : atrPct > 1.6 ? 2 : 1;
+    if (score > bestScore) { bestScore = score; best = tf; }
+  }
+  return { best, atrInfo };
+}
+
+// ── AKILLI ANALİZ: en uygun scalp TF + tüm TF trend uyumu ──
+async function smartAnalyze(symbol) {
+  const sym = symbol.toUpperCase().replace('USDT', '').replace('/', '').trim();
+
+  // 1. Üst TF trend analizi
+  const bias = await getMultiTFBias(sym);
+  // 2. En uygun scalp TF
+  const { best: scalpTF, atrInfo } = await pickBestScalpTF(sym);
+
+  // 3. Seçilen scalp TF'de analiz
+  const bars = await fetchOHLC(sym, scalpTF);
+  if (!bars || bars.length < 30) {
+    return `❌ <b>${sym}</b> için veri bulunamadı.\n\n` +
+      `Bu coin OKX vadeli işlemlerinde bulunamadı.\n` +
+      `• Coin ismini kontrol et\n• /list ile mevcut coinleri gör`;
+  }
+
+  const price = bars[bars.length-1].c;
+  const sig = calcScalpSignal(bars, price);
+  const bt  = backtestScalp(bars, scalpTF);
+  if (!sig) return `❌ <b>${sym}</b> analiz edilemedi.`;
+
+  const dec = price > 100 ? 2 : price > 1 ? 4 : 6;
+  const f = v => v.toLocaleString('tr-TR', { minimumFractionDigits: dec, maximumFractionDigits: dec });
+
+  // Scalp yönü ile üst TF trendi uyumlu mu?
+  const aligned = sig.dir === bias.dominantBias;
+  const alignWarn = aligned
+    ? '✅ Scalp yönü üst zaman dilimleriyle UYUMLU'
+    : '⚠️ DİKKAT: Scalp yönü üst trende TERS — riskli';
+
+  // Üst TF güvenini scalp güvenine kat
+  let finalConf = sig.confidence;
+  if (aligned) finalConf = Math.min(100, Math.round(finalConf * 0.6 + bias.aligned * 100 * 0.4));
+  else finalConf = Math.round(finalConf * 0.5); // ters trendde güveni düşür
+
+  // Entry/SL/TP
+  const atr = sig.atr || price * 0.005;
+  const slPctMax = { '1m':0.005,'5m':0.008,'15m':0.012 }[scalpTF] || 0.008;
+  const slDist = Math.min(atr * 0.8, price * slPctMax);
+  const entry = price;
+  const sl  = sig.dir === 'LONG' ? entry - slDist : entry + slDist;
+  const tp1 = sig.dir === 'LONG' ? entry + slDist : entry - slDist;
+  const tp2 = sig.dir === 'LONG' ? entry + slDist*2 : entry - slDist*2;
+  const tp3 = sig.dir === 'LONG' ? entry + slDist*3.5 : entry - slDist*3.5;
+
+  const dirEmoji = sig.dir === 'LONG' ? '🟢⬆️' : '🔴⬇️';
+  const confEmoji = finalConf >= 75 ? '🔥' : finalConf >= 60 ? '✅' : '⚠️';
+  const flow = sig.orderFlow;
+
+  // Üst TF trend özeti
+  const tfLabel = { '15m':'15dk','1h':'1sa','4h':'4sa','1d':'1gün' };
+  const trendSummary = ['15m','1h','4h','1d'].map(tf => {
+    const t = bias.trends[tf];
+    if (!t) return `${tfLabel[tf]}: --`;
+    const arrow = t.dir === 'LONG' ? '🟢' : '🔴';
+    return `${tfLabel[tf]}: ${arrow}`;
+  }).join('  ');
+
+  const btNote = bt && bt.total > 0
+    ? `\n📊 <b>Backtest (${scalpTF}):</b> %${bt.winRate} (${bt.total} işlem, ${bt.profitable?'+':''}${bt.totalPnl}%)`
+    : '';
+
+  let recommendation;
+  if (finalConf >= 75 && aligned) recommendation = `${confEmoji} <b>GÜÇLÜ ${sig.dir}</b> — Giriş için uygun`;
+  else if (finalConf >= 60 && aligned) recommendation = `${confEmoji} <b>ORTA ${sig.dir}</b> — Teyit bekle`;
+  else if (!aligned) recommendation = `${confEmoji} <b>ZAYIF</b> — Üst trende ters, bekle`;
+  else recommendation = `${confEmoji} <b>NÖTR</b> — Net giriş yok`;
+
+  return `${dirEmoji} <b>${sym} AKILLI ANALİZ</b>
+🎯 Önerilen scalp: <b>${scalpTF}</b> (volatiliteye göre seçildi)
+
+💰 Fiyat: <b>$${f(price)}</b>
+🎯 Güven: <b>%${finalConf}</b> ${aligned ? '' : '(ters trend, düşürüldü)'}
+${recommendation}
+
+<b>📊 Tüm Zaman Dilimleri Yönü:</b>
+${trendSummary}
+Genel eğilim: <b>${bias.dominantBias}</b> (%${bias.bullPct} boğa)
+${alignWarn}
+
+<b>Giriş Seviyeleri (${sig.dir} · ${scalpTF}):</b>
+▫️ Giriş: $${f(entry)}
+🛑 SL: $${f(sl)} (${(slDist/entry*100).toFixed(2)}%)
+✅ TP1: $${f(tp1)}
+✅ TP2: $${f(tp2)}
+✅ TP3: $${f(tp3)}
+
+<b>Sinyaller:</b>
+${sig.signals.length ? sig.signals.slice(0,4).map(s=>'• '+s).join('\n') : '• Net sinyal yok'}
+${flow ? `\n<b>Order Flow:</b> Alım %${flow.buyPct.toFixed(0)} / Satım %${flow.sellPct.toFixed(0)}` : ''}
+📈 RSI: ${sig.rsiNow ? sig.rsiNow.toFixed(1) : '--'}${btNote}
+
+⚠️ <i>Yatırım tavsiyesi değildir.</i>`;
+}
+
 async function analyzeCoinForCommand(symbol, tf) {
   tf = tf || CONFIG.scalpTF;
   const sym = symbol.toUpperCase().replace('USDT', '').replace('/', '').trim();
@@ -650,18 +814,33 @@ async function pollCommands() {
 
       // /coins komutu - kaç coin var
       if (text === '/coins') {
+        const okxCount = Object.keys(SYMBOL_REGISTRY.okx).length;
+        const bnCount  = Object.keys(SYMBOL_REGISTRY.binance).length;
+        const byCount  = Object.keys(SYMBOL_REGISTRY.bybit).length;
         const total = new Set([
           ...Object.keys(SYMBOL_REGISTRY.binance),
           ...Object.keys(SYMBOL_REGISTRY.bybit),
           ...Object.keys(SYMBOL_REGISTRY.okx),
         ]).size;
+        let msg = `🏦 <b>Analiz Edilebilen Coinler</b>\n\n`;
+        msg += `✅ OKX: <b>${okxCount}</b> coin (aktif)\n`;
+        if (bnCount > 0) msg += `✅ Binance: ${bnCount} coin\n`;
+        if (byCount > 0) msg += `✅ Bybit: ${byCount} coin\n`;
+        msg += `\n📊 Toplam <b>${total}</b> farklı coin analiz edilebilir.\n\n`;
+        msg += `Herhangi birinin ismini yaz, örn:\n<code>BTC</code> · <code>ETH 1h</code> · <code>SOL 5m 15m 1h</code>`;
+        await sendTelegramTo(chatId, msg);
+        continue;
+      }
+
+      // /list komutu - mevcut coinlerden örnekler göster
+      if (text === '/list') {
+        const coins = Object.keys(SYMBOL_REGISTRY.okx).sort();
+        const sample = coins.slice(0, 60).join(', ');
         await sendTelegramTo(chatId,
-          `🏦 <b>Mevcut Coin Sayısı</b>\n\n` +
-          `• Binance: ${Object.keys(SYMBOL_REGISTRY.binance).length}\n` +
-          `• Bybit: ${Object.keys(SYMBOL_REGISTRY.bybit).length}\n` +
-          `• OKX: ${Object.keys(SYMBOL_REGISTRY.okx).length}\n\n` +
-          `📊 Toplam <b>${total}</b> farklı coin analiz edilebilir.\n\n` +
-          `Herhangi birinin ismini yaz, analiz edeyim!`
+          `📋 <b>Mevcut Coinler (ilk 60)</b>\n\n` +
+          `<code>${sample}</code>\n\n` +
+          `...ve ${coins.length - 60} tane daha. Toplam ${coins.length} coin.\n\n` +
+          `Listede olmayan bir coin de deneyebilirsin, belki vardır!`
         );
         continue;
       }
@@ -670,15 +849,18 @@ async function pollCommands() {
       if (text === '/start' || text === '/help') {
         await sendTelegramTo(chatId,
           '🤖 <b>CryptoPro Bot Komutları</b>\n\n' +
-          '📊 <b>Coin analizi için:</b>\n' +
-          'Sadece coin ismini yaz, örn:\n' +
-          '<code>BTC</code> veya <code>ETH</code> veya <code>SOL</code>\n\n' +
+          '📊 <b>Akıllı analiz (önerilen):</b>\n' +
+          'Sadece coin ismini yaz: <code>BTC</code>\n' +
+          '→ En uygun scalp zaman dilimini otomatik seçer\n' +
+          '→ Tüm zaman dilimlerinin trendine bakar\n' +
+          '→ Üst trende ters sinyal verirse uyarır\n\n' +
           '⏱️ <b>Zaman dilimi seçmek için:</b>\n' +
           '<code>BTC 5m</code> — tek zaman dilimi\n' +
           '<code>BTC 5m 1h 4h</code> — birden fazla (max 5)\n\n' +
           '<b>Kullanılabilir zaman dilimleri:</b>\n' +
           '1m, 3m, 5m, 15m, 30m, 1h, 2h, 4h, 1d, 1w\n\n' +
-          '📋 <code>/coins</code> — kaç coin var gör\n\n' +
+          '📋 <code>/coins</code> — kaç coin var gör\n' +
+          '📜 <code>/list</code> — mevcut coinleri listele\n\n' +
           '🔔 Otomatik sinyaller %' + CONFIG.minConfidence + '+ güvende gelir.\n\n' +
           'Hadi bir coin yaz, analiz edeyim! 🚀'
         );
@@ -700,21 +882,26 @@ async function pollCommands() {
         continue;
       }
 
-      // Yazılan TF'leri topla (birden fazla olabilir)
+      // Yazılan TF'leri topla
       let tfs = parts.slice(1).filter(p => VALID_TFS.includes(p.toLowerCase())).map(p => p.toLowerCase());
-      if (tfs.length === 0) tfs = [CONFIG.scalpTF]; // hiç yazılmadıysa varsayılan
-      if (tfs.length > 5) tfs = tfs.slice(0, 5); // max 5 TF
 
-      // "Analiz ediliyor" mesajı
-      await sendTelegramTo(chatId, `⏳ <b>${coinSym.toUpperCase()}</b> analiz ediliyor (${tfs.join(', ')})...`);
-
-      // Her TF için analiz yap ve gönder
-      for (const tf of tfs) {
-        const analysis = await analyzeCoinForCommand(coinSym, tf);
+      if (tfs.length === 0) {
+        // TF YAZILMADI → akıllı analiz (en uygun scalp TF + tüm TF trend uyumu)
+        await sendTelegramTo(chatId, `⏳ <b>${coinSym.toUpperCase()}</b> akıllı analiz ediliyor (tüm zaman dilimleri taranıyor)...`);
+        const analysis = await smartAnalyze(coinSym);
         await sendTelegramTo(chatId, analysis);
-        await new Promise(r => setTimeout(r, 400)); // mesajlar arası kısa bekleme
+        console.log(new Date().toLocaleTimeString('tr-TR'), `- Akıllı analiz: ${coinSym} → ${chatId}`);
+      } else {
+        // TF YAZILDI → o spesifik TF(ler)de analiz
+        if (tfs.length > 5) tfs = tfs.slice(0, 5);
+        await sendTelegramTo(chatId, `⏳ <b>${coinSym.toUpperCase()}</b> analiz ediliyor (${tfs.join(', ')})...`);
+        for (const tf of tfs) {
+          const analysis = await analyzeCoinForCommand(coinSym, tf);
+          await sendTelegramTo(chatId, analysis);
+          await new Promise(r => setTimeout(r, 400));
+        }
+        console.log(new Date().toLocaleTimeString('tr-TR'), `- Komut: ${coinSym} [${tfs.join(',')}] → ${chatId}`);
       }
-      console.log(new Date().toLocaleTimeString('tr-TR'), `- Komut: ${coinSym} [${tfs.join(',')}] → ${chatId}`);
     }
   } catch (e) {
     console.error('Poll error:', e.message);
