@@ -1,4 +1,5 @@
 const crypto = require('crypto');
+const fs = require('fs');
 
 // ================================================================
 // CryptoPro Telegram Scalp Signal Bot
@@ -63,6 +64,105 @@ const CONFIG = {
 const alarmHistory = {};
 // Açık pozisyonlar: { "BTCLONG": { sym, dir, entry, sl, tp1, tp2, tp3, leverage, openTime, tpHit:[] } }
 const openPositions = {};
+
+// ================================================================
+// ÖĞRENME MODU — geçmiş SL'lerden öğren, benzer hatayı tekrarlama (daha az SL)
+// Her kapanan işlemin sonucu (kazanç/kayıp) bağlamıyla kaydedilir; taramada
+// trend-karşıtı ve geçmişte kaybettiren kurulumlar ENGELLENİR. Kalıcı (JSON dosyası).
+// ================================================================
+const LEARN_FILE = clean(process.env.LEARN_FILE) || './learning.json';
+let learnLog = [];
+function loadLearning() {
+  try {
+    const d = JSON.parse(fs.readFileSync(LEARN_FILE, 'utf8'));
+    if (d && Array.isArray(d.log)) learnLog = d.log;
+    console.log('🧠 Öğrenme yüklendi:', learnLog.length, 'sonuç');
+  } catch (e) { learnLog = []; console.log('🧠 Öğrenme dosyası yok, sıfırdan başlıyor.'); }
+}
+function saveLearning() {
+  try { fs.writeFileSync(LEARN_FILE, JSON.stringify({ ver: 1, log: learnLog.slice(-2000) })); }
+  catch (e) { console.error('öğrenme kaydedilemedi:', e.message); }
+}
+// Üst-TF trendini kovaya indir: güçlü hizalı ise LONG/SHORT, değilse NEUTRAL
+function htfBucket(htf) {
+  if (!htf) return 'NEUTRAL';
+  if (htf.aligned >= 0.6) return htf.dominantBias;
+  return 'NEUTRAL';
+}
+function isCounterTrend(dir, htf) {
+  const b = htfBucket(htf);
+  return (b === 'LONG' && dir === 'SHORT') || (b === 'SHORT' && dir === 'LONG');
+}
+// Sonuç kaydet (win/loss) — pozisyon kapanınca çağrılır
+function recordOutcome(ctx, result) {
+  if (!ctx) return;
+  learnLog.push({ sym: ctx.sym, dir: ctx.dir, htf: ctx.htf, ct: ctx.ct ? 1 : 0, conf: ctx.conf, dist: ctx.dist, result, t: Date.now() });
+  if (learnLog.length > 2000) learnLog = learnLog.slice(-2000);
+  saveLearning();
+  console.log(`🧠 Sonuç kaydedildi: ${ctx.sym} ${ctx.dir} → ${result} (toplam ${learnLog.length})`);
+}
+// Kategori (yön + üst-TF durumu) kazanma oranı
+function bucketWR(dir, htfB) {
+  const rel = learnLog.filter(e => e.dir === dir && e.htf === htfB);
+  const w = rel.filter(e => e.result === 'win').length;
+  const n = rel.length;
+  return { n, w, l: n - w, wr: n ? w / n * 100 : null };
+}
+// Aynı coin+yön son 3 saatte kaybettirdi mi
+function recentLoss(sym, dir) {
+  const now = Date.now();
+  return learnLog.some(e => e.sym === sym && e.dir === dir && e.result === 'loss' && now - e.t < 3 * 3600 * 1000);
+}
+// Tekrar eden hata: bir özellik ≥3 kez kaybettirdiyse o özelliği taşıyan sinyali engelle
+function recurringBlock(ctx) {
+  const losses = learnLog.filter(e => e.result === 'loss');
+  if (losses.length < 4) return null;
+  const ctLoss = losses.filter(e => e.ct).length;
+  if (ctLoss >= 3 && ctx.ct) return 'trend karşıtı (' + ctLoss + ' kez kaybettirdi)';
+  const lowLoss = losses.filter(e => e.conf < 75).length;
+  if (lowLoss >= 3 && ctx.conf < 75) return 'düşük güven (' + lowLoss + ' kez kaybettirdi)';
+  return null;
+}
+// ANA ÖĞRENME KAPISI — girişe izin (null) ya da engel sebebi (string)
+function learnBlock(ctx) {
+  // 1) TREND KARŞITI + üst TF güçlü ters yönde → engelle (en sık SL sebebi)
+  //    Ama bu kategori kanıtlanmış kazançlıysa (≥%55, ≥5 örnek) izin ver.
+  if (ctx.ct) {
+    const b = bucketWR(ctx.dir, ctx.htf);
+    if (!(b.n >= 5 && b.wr != null && b.wr >= 55)) return 'trend karşıtı (üst TF ters yönde)';
+  }
+  // 2) Aynı coin+yön yakın zamanda kaybettirdi → tekrar girme
+  if (recentLoss(ctx.sym, ctx.dir)) return 'bu coin+yön yakında SL oldu';
+  // 3) Tekrar eden hata özelliği
+  const rb = recurringBlock(ctx); if (rb) return rb;
+  // 4) Kategori geçmişi zayıf (yeterli örnekle)
+  const b = bucketWR(ctx.dir, ctx.htf);
+  if (b.n >= 5 && b.wr != null && b.wr < 35) return 'kategori zayıf (%' + Math.round(b.wr) + ', ' + b.n + ' işlem)';
+  return null;
+}
+// Öğrenme özeti (/ogrenme komutu için)
+function learnSummary() {
+  const total = learnLog.length;
+  const wins = learnLog.filter(e => e.result === 'win').length;
+  const losses = total - wins;
+  const wr = total ? Math.round(wins / total * 100) : 0;
+  const ctLoss = learnLog.filter(e => e.result === 'loss' && e.ct).length;
+  const lowLoss = learnLog.filter(e => e.result === 'loss' && e.conf < 75).length;
+  // kategori kırılımı
+  const cats = {};
+  learnLog.forEach(e => { const k = e.dir + '|' + e.htf; cats[k] = cats[k] || { n: 0, w: 0 }; cats[k].n++; if (e.result === 'win') cats[k].w++; });
+  let catTxt = '';
+  Object.entries(cats).filter(([k, v]) => v.n >= 3).sort((a, b) => (a[1].w / a[1].n) - (b[1].w / b[1].n)).slice(0, 6)
+    .forEach(([k, v]) => { const p = k.split('|'); const w = Math.round(v.w / v.n * 100); const mark = w < 40 ? '🚫' : w >= 60 ? '⭐' : '•'; catTxt += `${mark} ${p[0]} (üst TF ${p[1]}): %${w} · ${v.n} işlem\n`; });
+  return '🧠 <b>Bot Ne Öğrendi</b>\n\n' +
+    `Toplam sonuç: <b>${total}</b> · Kazanç ${wins} · Kayıp ${losses} · Başarı %${wr}\n\n` +
+    (total < 5 ? '<i>Yeterli veri birikince kurallar netleşecek (her kapanan işlem buraya eklenir).</i>\n\n' : '') +
+    '<b>Sık kayıp sebepleri:</b>\n' +
+    `• Trend karşıtı: ${ctLoss} kez` + (ctLoss >= 3 ? ' → artık bloklanıyor ✓' : '') + '\n' +
+    `• Düşük güven (<%75): ${lowLoss} kez` + (lowLoss >= 3 ? ' → artık bloklanıyor ✓' : '') + '\n\n' +
+    (catTxt ? '<b>Kategori performansı:</b>\n' + catTxt : '');
+}
+
 
 // ── Telegram mesaj gönder ──
 async function sendTelegram(text) {
@@ -963,7 +1063,11 @@ async function monitorPositions() {
         }
       }
 
-      if (closePos) delete openPositions[sym];
+      if (closePos) {
+        // ── ÖĞRENME: sonucu kaydet (TP'ye ulaştıysa kazanç, hiç TP yoksa SL=kayıp) ──
+        recordOutcome(pos.learnCtx, pos.tpHit.length > 0 ? 'win' : 'loss');
+        delete openPositions[sym];
+      }
     } catch (e) {
       console.error(`${sym} pozisyon takip hatası:`, e.message);
     }
@@ -985,7 +1089,7 @@ async function scanForSignals() {
   console.log(new Date().toLocaleTimeString('tr-TR'), `- ${coins.length} coin hacim filtresinden geçti, ${candidates.length} tanesi detaylı taranıyor...`);
   let found = 0;
   // Teşhis sayaçları - neden sinyal verilmediğini görmek için
-  let noData = 0, lowConf = 0, deduped = 0, btFail = 0, scanned = 0, unreachable = 0, hasOpen = 0;
+  let noData = 0, lowConf = 0, deduped = 0, btFail = 0, scanned = 0, unreachable = 0, hasOpen = 0, learnSkip = 0;
   let bestSeen = { sym: null, conf: 0 };
 
   for (const coin of candidates) {
@@ -1025,6 +1129,15 @@ async function scanForSignals() {
       // AÇIK POZİSYON KONTROLÜ: bu coinde zaten açık pozisyon varsa yeni sinyal verme
       if (openPositions[coin.sym]) { hasOpen++; continue; }
 
+      // ── ÖĞRENME KAPISI: daha az SL için trend/geçmiş filtreleri ──
+      const htf = await getMultiTFBias(coin.sym).catch(() => null);
+      const ctxL = {
+        sym: coin.sym, dir: sig.dir, htf: htfBucket(htf),
+        ct: isCounterTrend(sig.dir, htf), conf: sig.confidence, dist: lv.distToZone || 0,
+      };
+      const blocked = learnBlock(ctxL);
+      if (blocked) { learnSkip++; console.log(`   🧠 ${coin.sym} ${sig.dir} atlandı: ${blocked}`); continue; }
+
       alarmHistory[key] = now;
       found++;
 
@@ -1036,6 +1149,7 @@ async function scanForSignals() {
         leverage: lv.leverage, openTime: Date.now(), tpHit: [],
         filled: lv.inZone,   // fiyat zaten bölgedeyse giriş yapıldı say, değilse bekle
         dec: price > 100 ? 2 : price > 1 ? 4 : 6,
+        learnCtx: ctxL,      // öğrenme bağlamı (sonuç kaydında kullanılır)
       };
 
       const dec = price > 100 ? 2 : price > 1 ? 4 : 6;
@@ -1118,7 +1232,7 @@ ${lv.inZone ? '🟢 <i>Fiyat şu an giriş bölgesinde - hemen girilebilir.</i>'
   // Detaylı teşhis logu
   console.log(new Date().toLocaleTimeString('tr-TR'),
     `- ✅ Tarama bitti | Tarandı: ${scanned} | Sinyal: ${found} | ` +
-    `Düşük güven: ${lowConf} | Backtest: ${btFail} | Uzak: ${unreachable} | Açık poz: ${hasOpen} | Tekrar: ${deduped} | Veri yok: ${noData}`);
+    `Düşük güven: ${lowConf} | Backtest: ${btFail} | Uzak: ${unreachable} | Açık poz: ${hasOpen} | Tekrar: ${deduped} | 🧠 Öğrenme: ${learnSkip} | Veri yok: ${noData}`);
   if (found === 0 && bestSeen.sym) {
     console.log(`   ℹ️ En yüksek güven: ${bestSeen.sym} ${bestSeen.dir||''} %${bestSeen.conf} (eşik %${CONFIG.minConfidence}). Uygun fırsat bulunamadı, bu normal.`);
   }
@@ -1475,6 +1589,12 @@ async function pollCommands() {
         continue;
       }
 
+      // /ogrenme komutu - botun öğrendikleri (SL azaltma)
+      if (text === '/ogrenme' || text === '/ogren' || text === '/learn') {
+        await sendTelegramTo(chatId, learnSummary());
+        continue;
+      }
+
       // /list komutu - mevcut coinlerden örnekler göster
       if (text === '/list') {
         const coins = Object.keys(SYMBOL_REGISTRY.okx).sort();
@@ -1504,6 +1624,7 @@ async function pollCommands() {
           '1m, 3m, 5m, 15m, 30m, 1h, 2h, 4h, 1d, 1w\n\n' +
           '📋 <code>/coins</code> — kaç coin var gör\n' +
           '📜 <code>/list</code> — mevcut coinleri listele\n' +
+          '🧠 <code>/ogrenme</code> — bot ne öğrendi (SL azaltma)\n' +
           '📊 <code>/positions</code> — açık pozisyonları gör\n' +
           '✖️ <code>/kapat BTC</code> — pozisyonu takipten çıkar\n' +
           '💰 <code>/bakiye</code> — OKX bakiyeni gör\n' +
@@ -1586,6 +1707,9 @@ async function start() {
 
   // Borsa sembollerini yükle (tüm coinler)
   await loadSymbolRegistry();
+
+  // Öğrenme verisini yükle (geçmiş SL/TP sonuçları — daha az SL için)
+  loadLearning();
 
   // First scan immediately
   await scanForSignals();
