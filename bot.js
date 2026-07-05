@@ -177,6 +177,7 @@ const DEX_POOLS = {};
   const p = x.split(':'); if (p.length >= 3) DEX_POOLS[p[0].trim().toUpperCase()] = { network: p[1].trim(), pool: p[2].trim() };
 });
 const spotPositions = {};
+let _lastSpotSource = '';   // son başarılı spot veri kaynağı (mesajlarda gösterilir)
 
 // SPOT mum verisi: OKX spot → Bybit spot → Binance spot → DEX (GeckoTerminal)
 const _spotTf = {
@@ -190,29 +191,35 @@ async function fetchSpotOHLC(sym, tf) {
     const bar = _spotTf.okx[tf] || '5m';
     const r = await fetch(`https://www.okx.com/api/v5/market/candles?instId=${sym}-USDT&bar=${bar}&limit=200`);
     const d = await r.json();
-    if (d.code === '0' && d.data && d.data.length >= 10)
+    if (d.code === '0' && d.data && d.data.length >= 10) {
+      _lastSpotSource = 'OKX Spot';
       return d.data.reverse().map(k => ({ t:+k[0], o:+k[1], h:+k[2], l:+k[3], c:+k[4], vol:+k[5] }));
+    }
   } catch (e) {}
   // 2) Bybit spot
   try {
     const iv = _spotTf.bybit[tf] || '5';
     const r = await fetch(`https://api.bybit.com/v5/market/kline?category=spot&symbol=${sym}USDT&interval=${iv}&limit=200`);
     const d = await r.json();
-    if (d.retCode === 0 && d.result && d.result.list && d.result.list.length >= 10)
+    if (d.retCode === 0 && d.result && d.result.list && d.result.list.length >= 10) {
+      _lastSpotSource = 'Bybit Spot';
       return d.result.list.reverse().map(k => ({ t:+k[0], o:+k[1], h:+k[2], l:+k[3], c:+k[4], vol:+k[5] }));
+    }
   } catch (e) {}
   // 3) Binance spot
   try {
     const iv = _spotTf.binance[tf] || '5m';
     const r = await fetch(`https://api.binance.com/api/v3/klines?symbol=${sym}USDT&interval=${iv}&limit=200`);
     const d = await r.json();
-    if (Array.isArray(d) && d.length >= 10)
+    if (Array.isArray(d) && d.length >= 10) {
+      _lastSpotSource = 'Binance Spot';
       return d.map(k => ({ t:k[0], o:+k[1], h:+k[2], l:+k[3], c:+k[4], vol:+k[5] }));
+    }
   } catch (e) {}
   // 4) DEX (GeckoTerminal) — bu coin için havuz tanımlıysa
   if (DEX_POOLS[sym]) {
     const b = await fetchDexOHLC(DEX_POOLS[sym].network, DEX_POOLS[sym].pool, tf);
-    if (b && b.length >= 10) return b;
+    if (b && b.length >= 10) { _lastSpotSource = 'DEX (' + DEX_POOLS[sym].network + ')'; return b; }
   }
   return null;
 }
@@ -1616,13 +1623,19 @@ async function analyzeCoinForCommand(symbol, tf) {
   tf = tf || CONFIG.scalpTF;
   const sym = symbol.toUpperCase().replace('USDT', '').replace('/', '').trim();
 
-  const bars = await fetchOHLC(sym, tf);
+  let bars = await fetchOHLC(sym, tf);
+  let isSpotData = false;
+  if (!bars || bars.length < 30) {
+    // Vadelide yok → SPOT'tan dene (OKX/Bybit/Binance spot + tanımlıysa DEX)
+    bars = await fetchSpotOHLC(sym, tf);
+    isSpotData = true;
+  }
   if (!bars || bars.length < 30) {
     return `❌ <b>${sym}</b> için veri bulunamadı.\n\n` +
-      `Bu coin Binance/Bybit/OKX vadeli işlemlerinde bulunamadı.\n\n` +
+      `Vadeli VE spot piyasalarda (Binance/Bybit/OKX${DEX_POOLS[sym] ? '/DEX' : ''}) bulunamadı.\n\n` +
       `• Coin ismini kontrol et (örn: BTC, ETH, SOL, DOGE, PEPE)\n` +
       `• USDT ekleme, sadece coin yaz\n` +
-      `• Çok yeni/küçük coinler olmayabilir`;
+      `• Sadece DEX'te işlem gören coin ise Railway'de <code>DEX_POOLS</code> değişkenine havuz ekle (README'de anlatıldı)`;
   }
 
   const price = bars[bars.length - 1].c;
@@ -1658,7 +1671,7 @@ async function analyzeCoinForCommand(symbol, tf) {
     recommendation = `${confEmoji} <b>ZAYIF SİNYAL</b> — Şu an net giriş yok, bekle`;
   }
 
-  return `${dirEmoji} <b>${sym} ANALİZ — ${tf}</b>
+  return `${dirEmoji} <b>${sym} ANALİZ — ${tf}</b>${isSpotData ? ' 🛒 <i>(SPOT — kaldıraçsız)</i>' : ''}
 
 💰 Fiyat: <b>$${f(price)}</b>
 🎯 Güven: <b>%${sig.confidence}</b>
@@ -1673,14 +1686,13 @@ ${lv.inZone ? '🟢 <b>Fiyat şu an giriş bölgesinde - işleme girilebilir</b>
 ✅ TP2: $${f(tp2)}
 ✅ TP3: $${f(tp3)}
 
-<b>⚡ Önerilen Kaldıraç: ${lv.leverage}x</b>
-<i>(Bakiyenin %${lv.riskPerTrade}'si risk · SL'de ~%${(lv.slPct*lv.leverage).toFixed(1)} kayıp)</i>
+${isSpotData ? '<b>🛒 SPOT — kaldıraç yok.</b> Yalnızca ALIM yönlü değerlendir; SHORT yapılamaz.' : `<b>⚡ Önerilen Kaldıraç: ${lv.leverage}x</b>\n<i>(Bakiyenin %${lv.riskPerTrade}'si risk · SL'de ~%${(lv.slPct*lv.leverage).toFixed(1)} kayıp)</i>`}
 
 <b>Sinyaller:</b>
 ${sig.signals.length ? sig.signals.slice(0, 5).map(s => '• ' + s).join('\n') : '• Net sinyal yok'}
 ${flow ? `\n<b>Order Flow:</b> Alım %${flow.buyPct.toFixed(0)} / Satım %${flow.sellPct.toFixed(0)}` : ''}
 📈 RSI: ${sig.rsiNow ? sig.rsiNow.toFixed(1) : '--'}${btNote}
-🏦 Borsalar: ${exNote}
+🏦 Borsalar: ${isSpotData ? (_lastSpotSource || 'Spot') : exNote}
 
 ⚠️ <i>Yatırım tavsiyesi değildir.</i>`;
 }
