@@ -164,6 +164,85 @@ function learnSummary() {
 }
 
 
+// ================================================================
+// SPOT (KALDIRAÇSIZ) MODÜLÜ — OKX'te vadeli olmayan coinler + DEX coinleri
+// SPOT_COINS listesindeki coinler için ALIM fırsatı → aldıktan sonra SATIŞ sinyali.
+// Veri: OKX spot → Bybit spot → Binance spot → (opsiyonel) GeckoTerminal DEX.
+// ================================================================
+const SPOT_COINS = (clean(process.env.SPOT_COINS) || '')
+  .split(',').map(s => s.trim().toUpperCase().replace('/', '').replace('USDT', '')).filter(Boolean);
+// DEX_POOLS formatı: "PONKE:solana:POOLADRESI,WIF:solana:POOL2"  (SEMBOL:ağ:havuz)
+const DEX_POOLS = {};
+(clean(process.env.DEX_POOLS) || '').split(',').forEach(x => {
+  const p = x.split(':'); if (p.length >= 3) DEX_POOLS[p[0].trim().toUpperCase()] = { network: p[1].trim(), pool: p[2].trim() };
+});
+const spotPositions = {};
+
+// SPOT mum verisi: OKX spot → Bybit spot → Binance spot → DEX (GeckoTerminal)
+const _spotTf = {
+  okx:    { '1m':'1m','5m':'5m','15m':'15m','1h':'1H','4h':'4H','1d':'1D' },
+  bybit:  { '1m':'1','5m':'5','15m':'15','1h':'60','4h':'240','1d':'D' },
+  binance:{ '1m':'1m','5m':'5m','15m':'15m','1h':'1h','4h':'4h','1d':'1d' },
+};
+async function fetchSpotOHLC(sym, tf) {
+  // 1) OKX spot
+  try {
+    const bar = _spotTf.okx[tf] || '5m';
+    const r = await fetch(`https://www.okx.com/api/v5/market/candles?instId=${sym}-USDT&bar=${bar}&limit=200`);
+    const d = await r.json();
+    if (d.code === '0' && d.data && d.data.length >= 10)
+      return d.data.reverse().map(k => ({ t:+k[0], o:+k[1], h:+k[2], l:+k[3], c:+k[4], vol:+k[5] }));
+  } catch (e) {}
+  // 2) Bybit spot
+  try {
+    const iv = _spotTf.bybit[tf] || '5';
+    const r = await fetch(`https://api.bybit.com/v5/market/kline?category=spot&symbol=${sym}USDT&interval=${iv}&limit=200`);
+    const d = await r.json();
+    if (d.retCode === 0 && d.result && d.result.list && d.result.list.length >= 10)
+      return d.result.list.reverse().map(k => ({ t:+k[0], o:+k[1], h:+k[2], l:+k[3], c:+k[4], vol:+k[5] }));
+  } catch (e) {}
+  // 3) Binance spot
+  try {
+    const iv = _spotTf.binance[tf] || '5m';
+    const r = await fetch(`https://api.binance.com/api/v3/klines?symbol=${sym}USDT&interval=${iv}&limit=200`);
+    const d = await r.json();
+    if (Array.isArray(d) && d.length >= 10)
+      return d.map(k => ({ t:k[0], o:+k[1], h:+k[2], l:+k[3], c:+k[4], vol:+k[5] }));
+  } catch (e) {}
+  // 4) DEX (GeckoTerminal) — bu coin için havuz tanımlıysa
+  if (DEX_POOLS[sym]) {
+    const b = await fetchDexOHLC(DEX_POOLS[sym].network, DEX_POOLS[sym].pool, tf);
+    if (b && b.length >= 10) return b;
+  }
+  return null;
+}
+// DEX mum verisi (GeckoTerminal, ücretsiz, key gerekmez)
+async function fetchDexOHLC(network, pool, tf) {
+  const gtTf  = { '1m':'minute','5m':'minute','15m':'minute','1h':'hour','4h':'hour','1d':'day' };
+  const gtAgg = { '1m':1,'5m':5,'15m':15,'1h':1,'4h':4,'1d':1 };
+  try {
+    const r = await fetch(`https://api.geckoterminal.com/api/v2/networks/${network}/pools/${pool}/ohlcv/${gtTf[tf]||'minute'}?aggregate=${gtAgg[tf]||5}&limit=200`);
+    const d = await r.json();
+    const list = d && d.data && d.data.attributes && d.data.attributes.ohlcv_list;
+    if (!list || list.length < 10) return null;
+    return list.reverse().map(k => ({ t:k[0]*1000, o:+k[1], h:+k[2], l:+k[3], c:+k[4], vol:+k[5] }));
+  } catch (e) { return null; }
+}
+// SPOT için üst-TF trend (spot verisiyle) — öğrenme kapısı için
+async function spotHtfBias(sym) {
+  const tfs = ['15m','1h','4h','1d']; const w = { '15m':1,'1h':2,'4h':3,'1d':4 };
+  let bull = 0, bear = 0, tot = 0;
+  for (const tf of tfs) {
+    const b = await fetchSpotOHLC(sym, tf);
+    if (!b || b.length < 22) continue;
+    const c = b.map(x => x.c); const e9 = ema(c, 9), e21 = ema(c, 21);
+    const wt = w[tf]; tot += wt; if (e9 >= e21) bull += wt; else bear += wt;
+  }
+  if (tot === 0) return { dominantBias: 'NEUTRAL', aligned: 0 };
+  return { dominantBias: bull >= bear ? 'LONG' : 'SHORT', aligned: Math.max(bull, bear) / tot };
+}
+
+
 // ── Telegram mesaj gönder ──
 async function sendTelegram(text) {
   const url = `https://api.telegram.org/bot${TG_TOKEN}/sendMessage`;
@@ -1074,6 +1153,111 @@ async function monitorPositions() {
   }
 }
 
+// ================================================================
+// SPOT TARAMA — SPOT_COINS listesindeki coinlerde ALIM fırsatı ara
+// (Sadece ALIM/LONG; spotta short yok. Kaldıraçsız.)
+// ================================================================
+async function scanSpotWatchlist() {
+  if (!SPOT_COINS.length) return;
+  for (const sym of SPOT_COINS) {
+    try {
+      if (spotPositions[sym]) continue;                 // zaten alımdayız
+      const bars = await fetchSpotOHLC(sym, CONFIG.scalpTF);
+      if (!bars || bars.length < 30) { console.log(`   spot ${sym}: veri bulunamadı`); continue; }
+      const price = bars[bars.length - 1].c;
+      const sig = calcScalpSignal(bars, price);
+      if (!sig || sig.dir !== 'LONG') continue;          // SPOT: yalnızca ALIM
+      if (sig.confidence < CONFIG.minConfidence) continue;
+
+      const key = 'SPOT' + sym; const now = Date.now();
+      if (alarmHistory[key] && now - alarmHistory[key] < CONFIG.dedupeMinutes * 60000) continue;
+
+      const lv = calcEntryLevels(sig, price, CONFIG.scalpTF);
+      if (!lv.reachable) continue;
+      lv.leverage = 1;                                    // KALDIRAÇSIZ
+
+      // Öğrenme kapısı (spot üst-TF trendiyle) — kötü alımı ele
+      const htf = await spotHtfBias(sym).catch(() => null);
+      const ctxL = { sym, dir: 'LONG', htf: htfBucket(htf), ct: isCounterTrend('LONG', htf), conf: sig.confidence, dist: lv.distToZone || 0, spot: true };
+      const blocked = learnBlock(ctxL);
+      if (blocked) { console.log(`   🧠 spot ${sym} ALIM atlandı: ${blocked}`); continue; }
+
+      alarmHistory[key] = now;
+      const dec = price > 100 ? 2 : price > 1 ? 4 : 6;
+      spotPositions[sym] = {
+        sym, entry: lv.entry, sl: lv.sl, tp1: lv.tp1, tp2: lv.tp2, tp3: lv.tp3,
+        entryZoneLow: lv.entryZoneLow, entryZoneHigh: lv.entryZoneHigh,
+        openTime: now, tpHit: [], filled: lv.inZone, dec, learnCtx: ctxL,
+      };
+      const f = v => v.toLocaleString('tr-TR', { minimumFractionDigits: dec, maximumFractionDigits: dec });
+      await sendTelegram(
+        `🟢🛒 <b>SPOT ALIM FIRSATI — ${sym}</b> <i>(kaldıraçsız)</i>\n\n` +
+        `💰 Anlık fiyat: <b>$${f(price)}</b>\n` +
+        `🎯 Güven: <b>%${sig.confidence}</b>\n\n` +
+        `<b>📍 Alım bölgesi:</b>\n$${f(lv.entryZoneLow)} — $${f(lv.entryZoneHigh)}\n` +
+        `▫️ İdeal alım: $${f(lv.entry)}\n` +
+        `🎯 Sat hedefleri: TP1 $${f(lv.tp1)} · TP2 $${f(lv.tp2)} · TP3 $${f(lv.tp3)}\n` +
+        `🛑 Zarar durdur (sat): $${f(lv.sl)} (${lv.slPct.toFixed(2)}%)\n\n` +
+        `<b>Sinyaller:</b>\n${sig.signals.slice(0, 4).map(s => '• ' + s).join('\n')}\n\n` +
+        `${lv.inZone ? '🟢 <i>Fiyat şu an alım bölgesinde.</i>' : `🟡 <i>Alım bölgesine ${lv.distToZone.toFixed(2)}% uzakta. Limit alım koy.</i>`}\n` +
+        `⚠️ <i>Spot alım — kaldıraç yok. Yatırım tavsiyesi değildir.</i>`
+      );
+      console.log(new Date().toLocaleTimeString('tr-TR'), `- 🛒 SPOT ALIM: ${sym} %${sig.confidence}`);
+      await new Promise(r => setTimeout(r, 800));
+    } catch (e) { console.error(`spot ${sym} hata:`, e.message); }
+  }
+}
+
+// SPOT pozisyon takibi — alım dolunca + satış (TP/zarar durdur/aşırı alım) sinyalleri
+async function monitorSpotPositions() {
+  const syms = Object.keys(spotPositions);
+  for (const sym of syms) {
+    const pos = spotPositions[sym];
+    try {
+      const bars = await fetchSpotOHLC(sym, '5m');
+      if (!bars || !bars.length) continue;
+      const cur = bars[bars.length - 1]; const price = cur.c, high = cur.h, low = cur.l;
+      const f = v => v.toLocaleString('tr-TR', { minimumFractionDigits: pos.dec, maximumFractionDigits: pos.dec });
+
+      // ALIM (limit) doldu mu
+      if (!pos.filled) {
+        if (low <= pos.entryZoneHigh) {
+          pos.filled = true;
+          await sendTelegram(`✅ <b>ALIM YAPILDI — ${sym}</b>\n\nGiriş: $${f(pos.entry)}\n🎯 Sat: TP1 $${f(pos.tp1)} · TP2 $${f(pos.tp2)} · TP3 $${f(pos.tp3)}\n🛑 Zarar durdur: $${f(pos.sl)}\n\nTakip ediliyor.`);
+        } else {
+          if (Date.now() - pos.openTime > 24 * 3600 * 1000) { delete spotPositions[sym]; console.log(`spot ${sym}: 24s alım bölgesine gelmedi, iptal`); }
+          continue;
+        }
+      }
+
+      let close = false, result = null;
+      if (low <= pos.sl) {
+        // Zarar durdur → SAT
+        await sendTelegram(`🔴 <b>SATIŞ SİNYALİ (zarar durdur) — ${sym}</b>\n\nAlım: $${f(pos.entry)}\nSatış: $${f(pos.sl)}\nZarar: ~%${((pos.entry - pos.sl) / pos.entry * 100).toFixed(1)}\n\nPozisyon kapandı.`);
+        close = true; result = pos.tpHit.length > 0 ? 'win' : 'loss';
+      } else {
+        if (high >= pos.tp3 && !pos.tpHit.includes(3)) {
+          pos.tpHit.push(3);
+          await sendTelegram(`🎯🎯🎯 <b>SATIŞ SİNYALİ — ${sym} TP3</b>\n\nFiyat: $${f(pos.tp3)}\nKâr: ~%${((pos.tp3 - pos.entry) / pos.entry * 100).toFixed(1)}\n\n✅ Tüm hedefler tamam — kalanı sat.`);
+          close = true; result = 'win';
+        } else if (high >= pos.tp2 && !pos.tpHit.includes(2)) {
+          pos.tpHit.push(2);
+          await sendTelegram(`🎯🎯 <b>SATIŞ SİNYALİ — ${sym} TP2</b>\n\nFiyat: $${f(pos.tp2)}\nKâr: ~%${((pos.tp2 - pos.entry) / pos.entry * 100).toFixed(1)}\n\n💡 Bir kısmını sat, zarar durdur girişe.`);
+        } else if (high >= pos.tp1 && !pos.tpHit.includes(1)) {
+          pos.tpHit.push(1);
+          await sendTelegram(`🎯 <b>SATIŞ SİNYALİ — ${sym} TP1</b>\n\nFiyat: $${f(pos.tp1)}\nKâr: ~%${((pos.tp1 - pos.entry) / pos.entry * 100).toFixed(1)}\n\n💡 Kârın bir kısmını sat.`);
+        }
+        // Aşırı alım uyarısı (RSI çok yüksek) — kâr aldıysan sat
+        if (!close && pos.filled && !pos.warnedRsi) {
+          const c = bars.map(x => x.c); const rs = rsiArr(c, 14); const rsi = rs[rs.length - 1] || 50;
+          if (rsi > 78) { pos.warnedRsi = true; await sendTelegram(`⚠️ <b>${sym}</b> RSI aşırı alımda (${Math.round(rsi)}). Kârda satmayı düşün — dönüş yakın olabilir.`); }
+        }
+      }
+      if (close) { recordOutcome(pos.learnCtx, result || 'loss'); delete spotPositions[sym]; }
+    } catch (e) { console.error(`spot takip ${sym} hata:`, e.message); }
+  }
+}
+
 async function scanForSignals() {
   const coins = await fetchHotCoins();
   if (!coins.length) {
@@ -1323,11 +1507,31 @@ async function smartAnalyze(symbol) {
   const { best: scalpTF, atrInfo } = await pickBestScalpTF(sym);
 
   // 3. Seçilen scalp TF'de analiz
-  const bars = await fetchOHLC(sym, scalpTF);
+  let bars = await fetchOHLC(sym, scalpTF);
+  let isSpot = false;
   if (!bars || bars.length < 30) {
-    return `❌ <b>${sym}</b> için veri bulunamadı.\n\n` +
-      `Bu coin OKX vadeli işlemlerinde bulunamadı.\n` +
-      `• Coin ismini kontrol et\n• /list ile mevcut coinleri gör`;
+    // Vadelide yok → SPOT'tan dene (OKX/Bybit/Binance spot + DEX)
+    bars = await fetchSpotOHLC(sym, scalpTF);
+    isSpot = true;
+    if (!bars || bars.length < 30) {
+      return `❌ <b>${sym}</b> için veri bulunamadı.\n\n` +
+        `Vadeli VE spot piyasalarda (OKX/Bybit/Binance${DEX_POOLS[sym] ? '/DEX' : ''}) bulunamadı.\n` +
+        `• Coin ismini kontrol et\n• /list ile mevcut coinleri gör\n` +
+        `• DEX coini ise Railway'de DEX_POOLS değişkenine havuz ekle`;
+    }
+    // Üst-TF trendini SPOT verisiyle yeniden hesapla (vadeli verisi yok)
+    for (const tf of ['15m','1h','4h','1d']) {
+      const sb = await fetchSpotOHLC(sym, tf);
+      if (!sb || sb.length < 22) { bias.trends[tf] = null; continue; }
+      const c = sb.map(x => x.c); const e9s = ema(c, 9), e21s = ema(c, 21);
+      bias.trends[tf] = { dir: e9s >= e21s ? 'LONG' : 'SHORT', trend: '--', conf: 0 };
+    }
+    const sw = { '15m':1,'1h':2,'4h':3,'1d':4 }; let bs = 0, tot2 = 0;
+    for (const tf in sw) { const t = bias.trends[tf]; if (!t) continue; tot2 += sw[tf]; if (t.dir === 'LONG') bs += sw[tf]; }
+    bias.bullPct = tot2 ? Math.round(bs / tot2 * 100) : 50;
+    bias.bearPct = 100 - bias.bullPct;
+    bias.dominantBias = bias.bullPct >= 50 ? 'LONG' : 'SHORT';
+    bias.aligned = tot2 ? Math.max(bs, tot2 - bs) / tot2 : 0;
   }
 
   const price = bars[bars.length-1].c;
@@ -1377,7 +1581,7 @@ async function smartAnalyze(symbol) {
   else if (!aligned) recommendation = `${confEmoji} <b>ZAYIF</b> — Üst trende ters, bekle`;
   else recommendation = `${confEmoji} <b>NÖTR</b> — Net giriş yok`;
 
-  return `${dirEmoji} <b>${sym} AKILLI ANALİZ</b>
+  return `${dirEmoji} <b>${sym} AKILLI ANALİZ</b>${isSpot ? ' 🛒 <i>(SPOT — vadelide yok, kaldıraçsız)</i>' : ''}
 🎯 Önerilen scalp: <b>${scalpTF}</b> (volatiliteye göre seçildi)
 
 💰 Fiyat: <b>$${f(price)}</b>
@@ -1398,8 +1602,7 @@ ${lv.inZone ? '🟢 <b>Fiyat şu an giriş bölgesinde - işleme girilebilir</b>
 ✅ TP2: $${f(tp2)}
 ✅ TP3: $${f(tp3)}
 
-<b>⚡ Önerilen Kaldıraç: ${lv.leverage}x</b>
-<i>(Bakiyenin %${lv.riskPerTrade}'si risk · SL'de ~%${(lv.slPct*lv.leverage).toFixed(1)} kayıp)</i>
+${isSpot ? '<b>🛒 SPOT — kaldıraç yok.</b> Yalnızca ALIM yönlü değerlendir; SHORT yapılamaz.' : `<b>⚡ Önerilen Kaldıraç: ${lv.leverage}x</b>\n<i>(Bakiyenin %${lv.riskPerTrade}'si risk · SL'de ~%${(lv.slPct*lv.leverage).toFixed(1)} kayıp)</i>`}
 
 <b>Sinyaller:</b>
 ${sig.signals.length ? sig.signals.slice(0,4).map(s=>'• '+s).join('\n') : '• Net sinyal yok'}
@@ -1595,6 +1798,19 @@ async function pollCommands() {
         continue;
       }
 
+      // /spot komutu - spot izleme listesi + açık spot pozisyonları
+      if (text === '/spot') {
+        let m = '🛒 <b>SPOT (kaldıraçsız) izleme</b>\n\n';
+        m += SPOT_COINS.length ? ('İzlenen: ' + SPOT_COINS.join(', ') + '\n\n') : 'Liste boş. Railway → Variables → <code>SPOT_COINS</code>=PONKE,WIF,BONK ekle.\n\n';
+        const open = Object.values(spotPositions);
+        if (open.length) {
+          m += '<b>Açık spot pozisyonlar:</b>\n';
+          open.forEach(p => { m += `• ${p.sym} — giriş $${p.entry} ${p.filled ? '(alındı)' : '(bekliyor)'} · TP alınan: ${p.tpHit.join(',') || '-'}\n`; });
+        } else m += 'Açık spot pozisyon yok.';
+        await sendTelegramTo(chatId, m);
+        continue;
+      }
+
       // /list komutu - mevcut coinlerden örnekler göster
       if (text === '/list') {
         const coins = Object.keys(SYMBOL_REGISTRY.okx).sort();
@@ -1625,6 +1841,7 @@ async function pollCommands() {
           '📋 <code>/coins</code> — kaç coin var gör\n' +
           '📜 <code>/list</code> — mevcut coinleri listele\n' +
           '🧠 <code>/ogrenme</code> — bot ne öğrendi (SL azaltma)\n' +
+          '🛒 <code>/spot</code> — spot (kaldıraçsız) izleme listesi\n' +
           '📊 <code>/positions</code> — açık pozisyonları gör\n' +
           '✖️ <code>/kapat BTC</code> — pozisyonu takipten çıkar\n' +
           '💰 <code>/bakiye</code> — OKX bakiyeni gör\n' +
@@ -1713,12 +1930,15 @@ async function start() {
 
   // First scan immediately
   await scanForSignals();
+  if (SPOT_COINS.length) { console.log('🛒 Spot izleme listesi:', SPOT_COINS.join(', ')); await scanSpotWatchlist(); }
 
   // Then scan periodically
   setInterval(scanForSignals, CONFIG.scanInterval);
+  if (SPOT_COINS.length) setInterval(scanSpotWatchlist, CONFIG.scanInterval);
 
   // Açık pozisyonları her 30 saniyede kontrol et (SL/TP bildirimleri için)
   setInterval(monitorPositions, 30000);
+  if (SPOT_COINS.length) setInterval(monitorSpotPositions, 30000);
   console.log('📍 Pozisyon takibi aktif - SL/TP geldiğinde bildirim gelecek');
 
   // Komut dinleme döngüsü (sürekli)
