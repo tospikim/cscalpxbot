@@ -180,6 +180,37 @@ const spotPositions = {};
 let _lastSpotSource = '';   // son başarılı spot veri kaynağı (mesajlarda gösterilir)
 const _spotCache = {};      // kısa önbellek: {key: {t, v, src}} — DEX rate limitini korur (GT: ~30 istek/dk)
 
+// ── MEXC SPOT PAZARINI OTOMATİK TARA (vadeli tarayıcı gibi) ──
+// Tüm MEXC spot coinlerini hacim+hareket ile filtreler, en sıcakları döner.
+// Vadelide (OKX/Binance/Bybit) zaten izlenen coinler ATLANIR (çift sinyal olmasın) —
+// yani bu tarama, SADECE spotta listeli coinleri (memecoinler vb.) yakalar.
+const SPOT_SCAN = { minVol: 2000000, top: 25 };   // min $2M 24s hacim, en iyi 25 coin
+const _lvrToken = /(3L|3S|5L|5S|2L|2S|4L|4S)$/;
+const _stables = new Set(['USDC','TUSD','DAI','FDUSD','USDE','PYUSD','USDD','EURT','USD1']);
+async function fetchMexcHotSpot() {
+  try {
+    const r = await fetch('https://api.mexc.com/api/v3/ticker/24hr');
+    const d = await r.json();
+    if (!Array.isArray(d)) return [];
+    const filtered = d
+      .filter(t => t.symbol && t.symbol.endsWith('USDT'))
+      .map(t => {
+        const base = t.symbol.slice(0, -4);
+        return { sym: base, price: +t.lastPrice || 0, chg24: +t.priceChangePercent * 100 || +t.priceChangePercent || 0, vol: +t.quoteVolume || 0 };
+      })
+      .filter(c => c.price > 0
+        && !_lvrToken.test(c.sym) && !_stables.has(c.sym)
+        && !SYMBOL_REGISTRY.okx[c.sym] && !SYMBOL_REGISTRY.binance[c.sym] && !SYMBOL_REGISTRY.bybit[c.sym]);  // vadelide varsa atla
+    // TÜM evren (ölü çiftler hariç, min $300k hacim) — dönüşümlü tam tarama için sakla
+    global._mexcAll = filtered.filter(c => c.vol > 300000).map(c => c.sym);
+    // Sıcak liste (hızlı tepki): min $2M hacim, en hareketli 25
+    return filtered.filter(c => c.vol > SPOT_SCAN.minVol)
+      .map(c => ({ ...c, score: Math.abs(c.chg24) * 1.5 + (c.vol / 1e9) * 0.5 }))
+      .sort((a, b) => b.score - a.score).slice(0, SPOT_SCAN.top).map(c => c.sym);
+  } catch (e) { console.error('MEXC spot tarama hatası:', e.message); return []; }
+}
+let _spotRotIdx = 0;   // dönüşümlü tam-liste imleci (her turda 40 coin, tüm liste sırayla biter ve başa döner)
+
 // SPOT mum verisi: OKX spot → Bybit spot → Binance spot → DEX (GeckoTerminal)
 const _spotTf = {
   okx:    { '1m':'1m','5m':'5m','15m':'15m','1h':'1H','4h':'4H','1d':'1D' },
@@ -342,6 +373,71 @@ function detectMACross(bars, fast, slow) {
     if (f[i - 1] >= s[i - 1] && f[i] < s[i]) return { type: 'death', barsAgo: c.length - 1 - i };
   }
   return null;
+}
+// ── KESİŞİM YAKLAŞIYOR tespiti — MA'lar birbirine yakınsıyor, kesişim henüz olmadı ──
+// Kesişim fiyatlanmadan ÖNCE erken sinyal verir. golden_soon: hızlı MA alttan yaklaşıyor
+// (yakında golden cross → LONG fırsatı), death_soon: üstten yaklaşıyor (SHORT fırsatı).
+function detectMAConvergence(bars, fast, slow) {
+  if (!bars || bars.length < slow + 8) return null;
+  const c = bars.map(b => b.c);
+  const f = emaSeries(c, fast), s = emaSeries(c, slow);
+  const n = c.length - 1;
+  const gap = (i) => (f[i] - s[i]) / s[i] * 100;           // % fark (işaretli)
+  const gNow = gap(n), gPrev = gap(n - 3);                  // 3 mum önceki fark
+  if (Math.abs(gNow) >= Math.abs(gPrev)) return null;       // yakınsama YOK (açılıyor)
+  const esik = slow >= 100 ? 0.45 : 0.25;                   // 50/200 için %0.45, 9/21 için %0.25
+  if (Math.abs(gNow) > esik) return null;                   // henüz yeterince yakın değil
+  const hiz = (Math.abs(gPrev) - Math.abs(gNow)) / 3;       // mum başına kapanma hızı
+  const etaBars = hiz > 0 ? Math.max(1, Math.round(Math.abs(gNow) / hiz)) : 99;
+  if (etaBars > 15) return null;                            // çok uzak, sayma
+  return { type: gNow < 0 ? 'golden_soon' : 'death_soon', gapPct: Math.abs(gNow), etaBars };
+}
+// Bir TF'nin tam MA durumu (kesişim + yaklaşma, 50/200 ve 9/21)
+function maStatusForTF(bars, tfAd) {
+  if (!bars || bars.length < 40) return null;
+  const parts = [];
+  const big = detectMACross(bars, 50, 200);
+  if (big) parts.push(big.type === 'golden' ? `🌟 GOLDEN CROSS (${big.barsAgo} mum önce)` : `💀 DEATH CROSS (${big.barsAgo} mum önce)`);
+  else {
+    const conv = detectMAConvergence(bars, 50, 200);
+    if (conv) parts.push(conv.type === 'golden_soon'
+      ? `⏳🌟 Golden Cross YAKLAŞIYOR (fark %${conv.gapPct.toFixed(2)}, ~${conv.etaBars} mum) → erken LONG fırsatı`
+      : `⏳💀 Death Cross YAKLAŞIYOR (fark %${conv.gapPct.toFixed(2)}, ~${conv.etaBars} mum) → erken SHORT fırsatı`);
+  }
+  const sm = detectMACross(bars, 9, 21);
+  if (sm) parts.push(sm.type === 'golden' ? `🟢 9↑21 (${sm.barsAgo}m)` : `🔴 9↓21 (${sm.barsAgo}m)`);
+  else {
+    const sc = detectMAConvergence(bars, 9, 21);
+    if (sc) parts.push(sc.type === 'golden_soon' ? `⏳ 9→21 yukarı yaklaşıyor (~${sc.etaBars} mum)` : `⏳ 9→21 aşağı yaklaşıyor (~${sc.etaBars} mum)`);
+  }
+  return parts.length ? `<code>${tfAd}</code> ${parts.join(' · ')}` : null;
+}
+// ── KESİŞİM GÖZCÜSÜ — izlenen coinlerde tüm TF'lerde kesişim/yaklaşma bildirir ──
+const _maAlerted = {};   // dedupe: sym_tf_type → ts (12 saat)
+async function maCrossWatcher() {
+  try {
+    // İzlenecek evren: açık pozisyonlar + spot listesi + en sıcak 10 coin
+    const hot = (await fetchHotCoins()).sort((a, b) => b.scalpScore - a.scalpScore).slice(0, 10).map(c => c.sym);
+    const universe = [...new Set([...Object.keys(openPositions), ...Object.keys(spotPositions), ...SPOT_COINS, ...hot])].slice(0, 20);
+    const tfs = [['15m', '15dk'], ['1h', '1sa'], ['4h', '4sa'], ['1d', '1gün']];
+    for (const sym of universe) {
+      for (const [tf, ad] of tfs) {
+        let bars = await fetchOHLC(sym, tf);
+        if (!bars || bars.length < 60) bars = await fetchSpotOHLC(sym, tf);
+        if (!bars || bars.length < 60) continue;
+        const cross = detectMACross(bars, 50, 200);
+        const conv = cross ? null : detectMAConvergence(bars, 50, 200);
+        const ev = cross ? { k: cross.type, txt: cross.type === 'golden' ? `🌟 <b>GOLDEN CROSS — ${sym} (${ad})</b>\nEMA50, EMA200'ü YUKARI kesti (${cross.barsAgo} mum önce). Orta/uzun vade yükseliş dönüşü — LONG tarafı güçlendi.` : `💀 <b>DEATH CROSS — ${sym} (${ad})</b>\nEMA50, EMA200'ü AŞAĞI kesti (${cross.barsAgo} mum önce). Düşüş dönüşü — SHORT tarafı güçlendi.` }
+          : conv ? { k: conv.type, txt: conv.type === 'golden_soon' ? `⏳🌟 <b>GOLDEN CROSS YAKLAŞIYOR — ${sym} (${ad})</b>\nEMA50 alttan EMA200'e yaklaşıyor (fark %${conv.gapPct.toFixed(2)}, ~${conv.etaBars} mum). Kesişim fiyatlanmadan ERKEN LONG fırsatı olabilir.` : `⏳💀 <b>DEATH CROSS YAKLAŞIYOR — ${sym} (${ad})</b>\nEMA50 üstten EMA200'e yaklaşıyor (fark %${conv.gapPct.toFixed(2)}, ~${conv.etaBars} mum). Erken SHORT fırsatı olabilir.` } : null;
+        if (!ev) continue;
+        const key = `${sym}_${tf}_${ev.k}`;
+        if (_maAlerted[key] && Date.now() - _maAlerted[key] < 12 * 3600 * 1000) continue;
+        _maAlerted[key] = Date.now();
+        await sendTelegram(ev.txt + '\n\n<i>Yatırım tavsiyesi değildir.</i>');
+        await new Promise(r => setTimeout(r, 600));
+      }
+    }
+  } catch (e) { console.error('MA gözcüsü hatası:', e.message); }
 }
 // GRAFİK FORMASYONU TESPİTİ (pivotlardan: çift tepe/dip, (ters) omuz-baş-omuz)
 function detectChartPattern(bars) {
@@ -1398,21 +1494,58 @@ async function monitorPositions() {
 // (Sadece ALIM/LONG; spotta short yok. Kaldıraçsız.)
 // ================================================================
 async function scanSpotWatchlist() {
-  if (!SPOT_COINS.length) return;
-  for (const sym of SPOT_COINS) {
+  // ── LİSTE: manuel (SPOT_COINS) + MEXC spot pazarından OTOMATİK bulunan sıcak coinler ──
+  const autoList = await fetchMexcHotSpot();
+  // Dönüşümlü TAM tarama: her turda tüm listeden 40 coin — böylece MEXC'teki HER coin sırayla taranır
+  const all = global._mexcAll || [];
+  let rot = [];
+  if (all.length) {
+    rot = all.slice(_spotRotIdx, _spotRotIdx + 40);
+    if (rot.length < 40) rot = rot.concat(all.slice(0, 40 - rot.length));
+    _spotRotIdx = (_spotRotIdx + 40) % all.length;
+  }
+  const list = [...new Set([...SPOT_COINS, ...autoList, ...rot])];
+  if (!list.length) return;
+  console.log(new Date().toLocaleTimeString('tr-TR'), `- 🛒 Spot tarama: ${SPOT_COINS.length} manuel + ${autoList.length} sıcak + ${rot.length} dönüşümlü (toplam evren ${all.length}) = ${list.length} coin`);
+  for (const sym of list) {
     try {
       if (spotPositions[sym]) continue;                 // zaten alımdayız
-      const bars = await fetchSpotOHLC(sym, CONFIG.scalpTF);
-      if (!bars || bars.length < 30) { console.log(`   spot ${sym}: veri bulunamadı`); continue; }
-      const price = bars[bars.length - 1].c;
-      const sig = calcScalpSignal(bars, price);
-      if (!sig || sig.dir !== 'LONG') continue;          // SPOT: yalnızca ALIM
-      if (sig.confidence < CONFIG.minConfidence) continue;
+      const manual = SPOT_COINS.includes(sym);
+      // Otomatik coinlerde HIZLI ÖN FİLTRE (15m) — ancak umut varsa tam çoklu-TF taraması yap
+      if (!manual) {
+        const qb = await fetchSpotOHLC(sym, '15m');
+        if (!qb || qb.length < 30) continue;
+        const qs = calcScalpSignal(qb, qb[qb.length - 1].c);
+        if (!qs || qs.dir !== 'LONG' || qs.confidence < CONFIG.minConfidence - 12) continue;
+      }
+      // ── ÇOKLU-TF DEĞERLENDİRME: tüm TF'lerde ALIM sinyali ara, EN GÜVENLİSİNİ seç ──
+      // Uzun vadeli TF sinyali daha güçlü/güvenli sayılır (1gün > 4sa > 1sa > 15dk > 5dk)
+      const tfW = { '5m': 0, '15m': 2, '1h': 5, '4h': 9, '1d': 14 };
+      let best = null;
+      for (const tf of ['5m', '15m', '1h', '4h', '1d']) {
+        const bars = await fetchSpotOHLC(sym, tf);
+        if (!bars || bars.length < 30) continue;
+        const price = bars[bars.length - 1].c;
+        const sig = calcScalpSignal(bars, price);
+        if (!sig || sig.dir !== 'LONG') continue;        // SPOT: yalnızca ALIM
+        if (sig.confidence < CONFIG.minConfidence - 5) continue;
+        let score = sig.confidence + tfW[tf];
+        const cross = detectMACross(bars, 50, 200);
+        const conv = cross ? null : detectMAConvergence(bars, 50, 200);
+        let maNote = null;
+        if (cross && cross.type === 'golden') { score += 10; maNote = `🌟 Golden Cross (${tf})`; }
+        if (conv && conv.type === 'golden_soon') { score += 6; maNote = `⏳🌟 Golden Cross yaklaşıyor (${tf}, ~${conv.etaBars} mum)`; }
+        if (cross && cross.type === 'death') score -= 12;   // death cross'lu TF'de alma
+        if (!best || score > best.score) best = { tf, bars, price, sig, score, maNote };
+      }
+      if (!best) continue;
+      const { tf: bestTf, bars, price, sig } = best;
+      if (sig.confidence < CONFIG.minConfidence && !best.maNote) continue;   // MA desteği yoksa tam eşik ara
 
       const key = 'SPOT' + sym; const now = Date.now();
       if (alarmHistory[key] && now - alarmHistory[key] < CONFIG.dedupeMinutes * 60000) continue;
 
-      const lv = calcEntryLevels(sig, price, CONFIG.scalpTF);
+      const lv = calcEntryLevels(sig, price, bestTf);
       if (!lv.reachable) continue;
       lv.leverage = 1;                                    // KALDIRAÇSIZ
 
@@ -1432,8 +1565,9 @@ async function scanSpotWatchlist() {
       const f = v => v.toLocaleString('tr-TR', { minimumFractionDigits: dec, maximumFractionDigits: dec });
       await sendTelegram(
         `🟢🛒 <b>SPOT ALIM FIRSATI — ${sym}</b> <i>(kaldıraçsız)</i>\n\n` +
+        `⏱️ <b>En güvenli konum: ${bestTf}</b> grafiğinde bulundu${best.maNote ? '\n📐 ' + best.maNote : ''}\n` +
         `💰 Anlık fiyat: <b>$${f(price)}</b>\n` +
-        `🎯 Güven: <b>%${sig.confidence}</b>\n\n` +
+        `🎯 Güven: <b>%${sig.confidence}</b> (skor ${Math.round(best.score)})\n\n` +
         `<b>📍 Alım bölgesi:</b>\n$${f(lv.entryZoneLow)} — $${f(lv.entryZoneHigh)}\n` +
         `▫️ İdeal alım: $${f(lv.entry)}\n` +
         `🎯 Sat hedefleri: TP1 $${f(lv.tp1)} · TP2 $${f(lv.tp2)} · TP3 $${f(lv.tp3)}\n` +
@@ -1747,27 +1881,27 @@ async function pickBestScalpTF(sym) {
 
 // ── AKILLI ANALİZ: en uygun scalp TF + tüm TF trend uyumu ──
 async function smartAnalyze(symbol) {
+  global._lastChartUrl = null;   // eski grafiğin yanlış mesajla gitmesini önle
   const sym = symbol.toUpperCase().replace('USDT', '').replace('/', '').trim();
 
-  // 1. Üst TF trend analizi
-  const bias = await getMultiTFBias(sym);
-  // 2. En uygun scalp TF
-  const { best: scalpTF, atrInfo } = await pickBestScalpTF(sym);
-
-  // 3. Seçilen scalp TF'de analiz
-  let bars = await fetchOHLC(sym, scalpTF);
-  let isSpot = false;
-  if (!bars || bars.length < 30) {
-    // Vadelide yok → SPOT'tan dene (OKX/Bybit/Binance spot + DEX)
-    bars = await fetchSpotOHLC(sym, scalpTF);
-    isSpot = true;
+  // ── ÖNCELİK SPOT: uzun vadeli genel analiz (4sa) — spotta yoksa vadeliye düş ──
+  let bars = await fetchSpotOHLC(sym, '4h');
+  let isSpot = false, scalpTF, atrInfo = {};
+  if (bars && bars.length >= 30) {
+    isSpot = true; scalpTF = '4h';   // spot alım-satım için uzun vadeli genel bakış
+  } else {
+    const picked = await pickBestScalpTF(sym);
+    scalpTF = picked.best; atrInfo = picked.atrInfo;
+    bars = await fetchOHLC(sym, scalpTF);
     if (!bars || bars.length < 30) {
       return `❌ <b>${sym}</b> için veri bulunamadı.\n\n` +
-        `Vadeli VE spot piyasalarda (OKX/Bybit/Binance/MEXC/KuCoin/Gate + DEX otomatik arama) bulunamadı.\n` +
-        `• Coin ismini kontrol et\n• /list ile mevcut coinleri gör\n` +
-        `• DEX coini ise Railway'de DEX_POOLS değişkenine havuz ekle`;
+        `Spot VE vadeli piyasalarda (MEXC/OKX/Bybit/Binance/KuCoin/Gate + DEX otomatik arama) bulunamadı.\n` +
+        `• Coin ismini kontrol et\n• /list ile mevcut coinleri gör`;
     }
-    // Üst-TF trendini SPOT verisiyle yeniden hesapla (vadeli verisi yok)
+  }
+  const bias = await getMultiTFBias(sym);
+  if (isSpot) {
+    // Üst-TF trendini SPOT verisiyle hesapla (vadeli verisi yok/önceliksiz)
     for (const tf of ['15m','1h','4h','1d']) {
       const sb = await fetchSpotOHLC(sym, tf);
       if (!sb || sb.length < 22) { bias.trends[tf] = null; continue; }
@@ -1829,16 +1963,15 @@ async function smartAnalyze(symbol) {
   else if (!aligned) recommendation = `${confEmoji} <b>ZAYIF</b> — Üst trende ters, bekle`;
   else recommendation = `${confEmoji} <b>NÖTR</b> — Net giriş yok`;
 
-  // ── GELİŞMİŞ BÖLÜMLER: MA kesişimleri, formasyon, arz, haber ──
+  // ── GELİŞMİŞ BÖLÜMLER: MA kesişimleri (TÜM TF'ler, yaklaşanlar dahil), formasyon, arz, haber ──
   const bars1h = isSpot ? await fetchSpotOHLC(sym, '1h') : await fetchOHLC(sym, '1h');
   const bars4h = isSpot ? await fetchSpotOHLC(sym, '4h') : await fetchOHLC(sym, '4h');
+  const bars1d = isSpot ? await fetchSpotOHLC(sym, '1d') : await fetchOHLC(sym, '1d');
+  const bars15 = isSpot ? await fetchSpotOHLC(sym, '15m') : await fetchOHLC(sym, '15m');
   let maTxt = '';
-  const gc1h = detectMACross(bars1h, 50, 200), gc4h = detectMACross(bars4h, 50, 200);
-  const kc = detectMACross(bars, 9, 21);
-  if (gc4h) maTxt += `${gc4h.type === 'golden' ? '🌟 GOLDEN CROSS (4sa)' : '💀 DEATH CROSS (4sa)'} — ${gc4h.barsAgo} mum önce\n`;
-  if (gc1h) maTxt += `${gc1h.type === 'golden' ? '🌟 Golden Cross (1sa)' : '💀 Death Cross (1sa)'} — ${gc1h.barsAgo} mum önce\n`;
-  if (kc) maTxt += `${kc.type === 'golden' ? '🟢 EMA9↑EMA21 kesişimi' : '🔴 EMA9↓EMA21 kesişimi'} (${scalpTF}, ${kc.barsAgo} mum önce)\n`;
-  if (!maTxt) maTxt = 'Yakın zamanda MA kesişimi yok\n';
+  const maSet = [[bars15, '15dk'], [bars1h, '1sa '], [bars4h, '4sa '], [bars1d, '1gün'], [bars, scalpTF]];
+  for (const [b, ad] of maSet) { const st = maStatusForTF(b, ad); if (st) maTxt += st + '\n'; }
+  if (!maTxt) maTxt = 'Hiçbir TF\'de yakın kesişim/yaklaşma yok\n';
   const pat1h = detectChartPattern(bars1h) || detectChartPattern(bars);
   const patTxt = pat1h ? `${pat1h.dir === 'LONG' ? '🟢' : '🔴'} <b>${pat1h.name}</b> tespit edildi (${pat1h.dir} yönlü)` : 'Belirgin formasyon yok';
   const sup = await getSupplyInfo(sym);
@@ -1897,15 +2030,16 @@ ${flow ? `\n<b>Order Flow:</b> Alım %${flow.buyPct.toFixed(0)} / Satım %${flow
 }
 
 async function analyzeCoinForCommand(symbol, tf) {
+  global._lastChartUrl = null;   // eski grafiğin yanlış mesajla gitmesini önle
   tf = tf || CONFIG.scalpTF;
   const sym = symbol.toUpperCase().replace('USDT', '').replace('/', '').trim();
 
-  let bars = await fetchOHLC(sym, tf);
-  let isSpotData = false;
+  // ── ÖNCELİK SPOT: önce spot verisi dene, yoksa vadeliye düş ──
+  let bars = await fetchSpotOHLC(sym, tf);
+  let isSpotData = true;
   if (!bars || bars.length < 30) {
-    // Vadelide yok → SPOT'tan dene (OKX/Bybit/Binance spot + tanımlıysa DEX)
-    bars = await fetchSpotOHLC(sym, tf);
-    isSpotData = true;
+    bars = await fetchOHLC(sym, tf);
+    isSpotData = false;
   }
   if (!bars || bars.length < 30) {
     return `❌ <b>${sym}</b> için veri bulunamadı.\n\n` +
@@ -1947,6 +2081,9 @@ async function analyzeCoinForCommand(symbol, tf) {
   } else {
     recommendation = `${confEmoji} <b>ZAYIF SİNYAL</b> — Şu an net giriş yok, bekle`;
   }
+
+  // Grafik görüntüsü hazırla (bu TF için — mesajdan sonra fotoğraf olarak gönderilir)
+  global._lastChartUrl = await buildChartUrl(bars, sym, tf, { entry, sl, tp1, tp2, tp3 });
 
   return `${dirEmoji} <b>${sym} ANALİZ — ${tf}</b>${isSpotData ? ' 🛒 <i>(SPOT — kaldıraçsız)</i>' : ''}
 
@@ -2090,7 +2227,8 @@ async function pollCommands() {
       // /spot komutu - spot izleme listesi + açık spot pozisyonları
       if (text === '/spot') {
         let m = '🛒 <b>SPOT (kaldıraçsız) izleme</b>\n\n';
-        m += SPOT_COINS.length ? ('İzlenen: ' + SPOT_COINS.join(', ') + '\n\n') : 'Liste boş. Railway → Variables → <code>SPOT_COINS</code>=PONKE,WIF,BONK ekle.\n\n';
+        m += '🤖 <b>Otomatik tarama AÇIK</b> — MEXC spot pazarındaki en hareketli coinler (vadelide olmayanlar) sürekli taranıyor.\n';
+        m += SPOT_COINS.length ? ('➕ Manuel liste: ' + SPOT_COINS.join(', ') + '\n\n') : '➕ Manuel liste boş (istersen Railway → Variables → <code>SPOT_COINS</code>=PONKE,WIF ekle — bunlar her taramada öncelikli bakılır).\n\n';
         const open = Object.values(spotPositions);
         if (open.length) {
           m += '<b>Açık spot pozisyonlar:</b>\n';
@@ -2175,6 +2313,8 @@ async function pollCommands() {
         for (const tf of tfs) {
           const analysis = await analyzeCoinForCommand(coinSym, tf);
           await sendTelegramTo(chatId, analysis);
+          // Bu TF'nin mum grafiği (giriş/SL/TP işaretli)
+          if (global._lastChartUrl) { await sendTelegramPhoto(chatId, global._lastChartUrl, `📉 ${coinSym.toUpperCase()} ${tf} grafik`); global._lastChartUrl = null; }
           await new Promise(r => setTimeout(r, 400));
         }
         console.log(new Date().toLocaleTimeString('tr-TR'), `- Komut: ${coinSym} [${tfs.join(',')}] → ${chatId}`);
@@ -2221,20 +2361,26 @@ async function start() {
 
   // First scan immediately
   await scanForSignals();
-  if (SPOT_COINS.length) { console.log('🛒 Spot izleme listesi:', SPOT_COINS.join(', ')); await scanSpotWatchlist(); }
+  console.log('🛒 Spot tarama aktif: MEXC spot pazarı otomatik taranıyor' + (SPOT_COINS.length ? ' + manuel liste: ' + SPOT_COINS.join(', ') : ' (manuel liste boş — sorun değil)'));
+  await scanSpotWatchlist();
 
   // Then scan periodically
   setInterval(scanForSignals, CONFIG.scanInterval);
-  if (SPOT_COINS.length) setInterval(scanSpotWatchlist, CONFIG.scanInterval);
+  setInterval(scanSpotWatchlist, CONFIG.scanInterval);
 
   // Açık pozisyonları her 30 saniyede kontrol et (SL/TP bildirimleri için)
   setInterval(monitorPositions, 30000);
-  if (SPOT_COINS.length) setInterval(monitorSpotPositions, 30000);
+  setInterval(monitorSpotPositions, 30000);
 
   // 📰 Canlı haber takibi — 5 dakikada bir; olumlu/olumsuz haberleri coin ile bildirir
   newsMonitor();
   setInterval(newsMonitor, 5 * 60 * 1000);
   console.log('📰 Haber takibi aktif - olumlu/olumsuz haberler bildirilecek ve sinyallere katılacak');
+
+  // 📐 MA kesişim gözcüsü — 10 dakikada bir; kesişim VE yaklaşma bildirimleri (tüm TF'ler)
+  setInterval(maCrossWatcher, 10 * 60 * 1000);
+  setTimeout(maCrossWatcher, 60 * 1000);   // ilk tur 1 dk sonra (açılış yoğunluğunu bekle)
+  console.log('📐 MA kesişim gözcüsü aktif - golden/death cross ve YAKLAŞMA bildirimleri gelecek');
   console.log('📍 Pozisyon takibi aktif - SL/TP geldiğinde bildirim gelecek');
 
   // Komut dinleme döngüsü (sürekli)
