@@ -322,6 +322,167 @@ async function spotHtfBias(sym) {
 }
 
 
+// ================================================================
+// GELİŞMİŞ ANALİZ MODÜLÜ — MA kesişimleri, formasyonlar, arz, haber, grafik
+// ================================================================
+// EMA SERİSİ (kesişim tespiti için tüm geçmiş değerler)
+function emaSeries(vals, p) {
+  const out = []; if (!vals.length) return out;
+  const k = 2 / (p + 1); let e = vals[0];
+  for (let i = 0; i < vals.length; i++) { e = i ? vals[i] * k + e * (1 - k) : vals[0]; out.push(e); }
+  return out;
+}
+// GOLDEN / DEATH CROSS + kısa MA kesişimleri (son 12 mum içinde)
+function detectMACross(bars, fast, slow) {
+  if (!bars || bars.length < slow + 5) return null;
+  const c = bars.map(b => b.c);
+  const f = emaSeries(c, fast), s = emaSeries(c, slow);
+  for (let i = c.length - 1; i >= Math.max(slow, c.length - 12); i--) {
+    if (f[i - 1] <= s[i - 1] && f[i] > s[i]) return { type: 'golden', barsAgo: c.length - 1 - i };
+    if (f[i - 1] >= s[i - 1] && f[i] < s[i]) return { type: 'death', barsAgo: c.length - 1 - i };
+  }
+  return null;
+}
+// GRAFİK FORMASYONU TESPİTİ (pivotlardan: çift tepe/dip, (ters) omuz-baş-omuz)
+function detectChartPattern(bars) {
+  if (!bars || bars.length < 40) return null;
+  const piv = [];
+  for (let i = 3; i < bars.length - 3; i++) {
+    const h = bars[i].h, l = bars[i].l;
+    if (h > bars[i-1].h && h > bars[i-2].h && h > bars[i+1].h && h > bars[i+2].h) piv.push({ i, p: h, tip: 'H' });
+    if (l < bars[i-1].l && l < bars[i-2].l && l < bars[i+1].l && l < bars[i+2].l) piv.push({ i, p: l, tip: 'L' });
+  }
+  const his = piv.filter(x => x.tip === 'H').slice(-4), los = piv.filter(x => x.tip === 'L').slice(-4);
+  const near = (a, b, pct) => Math.abs(a - b) / ((a + b) / 2) * 100 < pct;
+  // Omuz-Baş-Omuz (3 tepe, ortadaki en yüksek, omuzlar yakın)
+  if (his.length >= 3) {
+    const [s1, bas, s2] = his.slice(-3);
+    if (bas.p > s1.p && bas.p > s2.p && near(s1.p, s2.p, 3)) return { name: 'Omuz-Baş-Omuz (OBO)', dir: 'SHORT' };
+  }
+  if (los.length >= 3) {
+    const [s1, bas, s2] = los.slice(-3);
+    if (bas.p < s1.p && bas.p < s2.p && near(s1.p, s2.p, 3)) return { name: 'Ters OBO', dir: 'LONG' };
+  }
+  // Çift tepe / çift dip
+  if (his.length >= 2) { const [a, b] = his.slice(-2); if (near(a.p, b.p, 1.5)) return { name: 'Çift Tepe (M)', dir: 'SHORT' }; }
+  if (los.length >= 2) { const [a, b] = los.slice(-2); if (near(a.p, b.p, 1.5)) return { name: 'Çift Dip (W)', dir: 'LONG' }; }
+  return null;
+}
+// ── ARZ ANALİZİ (CoinGecko ücretsiz) — kilit açılımı riski / arz sabit / seyreltme ──
+const _supplyCache = {};   // 6 saat TTL
+async function getSupplyInfo(sym) {
+  const ck = sym.toUpperCase();
+  const hit = _supplyCache[ck];
+  if (hit && Date.now() - hit.t < 6 * 3600 * 1000) return hit.v;
+  try {
+    const sr = await fetch(`https://api.coingecko.com/api/v3/search?query=${encodeURIComponent(ck)}`);
+    const sd = await sr.json();
+    const coin = (sd.coins || []).find(c => (c.symbol || '').toUpperCase() === ck) || (sd.coins || [])[0];
+    if (!coin) { _supplyCache[ck] = { t: Date.now(), v: null }; return null; }
+    const r = await fetch(`https://api.coingecko.com/api/v3/coins/${coin.id}?localization=false&tickers=false&community_data=false&developer_data=false`);
+    const d = await r.json();
+    const m = d.market_data || {};
+    const circ = m.circulating_supply, tot = m.total_supply, max = m.max_supply;
+    const mcap = m.market_cap && m.market_cap.usd, fdv = m.fully_diluted_valuation && m.fully_diluted_valuation.usd;
+    let notes = [];
+    const circPct = (circ && (max || tot)) ? circ / (max || tot) * 100 : null;
+    if (circPct != null) {
+      if (circPct < 55) notes.push(`⚠️ Dolaşımda sadece %${Math.round(circPct)} — kilit açılımlarıyla ARZ ARTIŞI riski yüksek (satış baskısı olabilir)`);
+      else if (circPct < 80) notes.push(`🟡 Dolaşımda %${Math.round(circPct)} — orta düzey kilit açılımı/seyreltme riski`);
+      else if (circPct >= 99) notes.push(`🟢 Arz neredeyse tamamen dolaşımda (%${Math.round(circPct)}) — kilit açılımı baskısı yok`);
+      else notes.push(`🟢 Dolaşımda %${Math.round(circPct)} — düşük seyreltme riski`);
+    }
+    if (max && tot && tot < max * 0.995) notes.push(`🔥 Toplam arz maks. arzın altında — yakım (burn) yapılmış olabilir`);
+    if (!max) notes.push(`⚠️ Maksimum arz TANIMSIZ — sınırsız basım/enflasyon riski`);
+    if (mcap && fdv && fdv > mcap * 1.8) notes.push(`⚠️ FDV, piyasa değerinin ${(fdv / mcap).toFixed(1)} katı — gelecekte ciddi arz girişi bekleniyor`);
+    const v = { circPct, notes, id: coin.id };
+    _supplyCache[ck] = { t: Date.now(), v };
+    return v;
+  } catch (e) { return hit ? hit.v : null; }
+}
+// ── HABER TAKİBİ (CryptoCompare — key gerekmez) + basit duygu analizi ──
+const NEWS_POS = ['listing','listed','partnership','integration','upgrade','mainnet','burn','buyback','adoption','approval','etf','institutional','funding','launch','surge','all-time high','ath','staking','airdrop','acquisition','expands'];
+const NEWS_NEG = ['hack','exploit','lawsuit','sec charges','delist','delisting','rug','scam','outage','halt','bankruptcy','liquidation','vulnerability','stolen','breach','fraud','investigation','sell-off','unlock','dump','fine','ban'];
+function newsSentimentScore(txt) {
+  const t = String(txt || '').toLowerCase();
+  let s = 0;
+  NEWS_POS.forEach(w => { if (t.includes(w)) s++; });
+  NEWS_NEG.forEach(w => { if (t.includes(w)) s -= 1.5; });
+  return s;
+}
+const newsSentiment = {};       // { SYM: { score, headline, ts } } — sinyallere katılır (6 saat geçerli)
+const _seenNews = new Set();
+let _newsFirstRun = true;
+async function newsMonitor() {
+  try {
+    const r = await fetch('https://min-api.cryptocompare.com/data/v2/news/?lang=EN&sortOrder=latest');
+    const d = await r.json();
+    const items = (d && d.Data) || [];
+    for (const it of items.slice(0, 40)) {
+      if (_seenNews.has(it.id)) continue;
+      _seenNews.add(it.id);
+      if (_seenNews.size > 800) { const arr = [..._seenNews]; arr.slice(0, 300).forEach(x => _seenNews.delete(x)); }
+      const cats = String(it.categories || '').split('|').map(s => s.trim().toUpperCase()).filter(Boolean);
+      const score = newsSentimentScore(it.title + ' ' + (it.body || '').slice(0, 400));
+      if (Math.abs(score) < 1) continue;   // nötr haberleri geç
+      // Bizim evrendeki coin'lerle eşleştir (vadeli registry + spot listesi + açık pozisyonlar)
+      const relevant = cats.filter(c => /^[A-Z0-9]{2,10}$/.test(c) && c !== 'ICO' && c !== 'ETF' &&
+        (SYMBOL_REGISTRY.okx[c] || SYMBOL_REGISTRY.binance[c] || SYMBOL_REGISTRY.bybit[c] || SPOT_COINS.includes(c) || openPositions[c] || spotPositions[c]));
+      if (!relevant.length) continue;
+      for (const symC of relevant.slice(0, 3)) {
+        newsSentiment[symC] = { score, headline: it.title, ts: Date.now() };
+        if (_newsFirstRun) continue;   // ilk çalıştırmada birikmiş haberleri BİLDİRME (sadece kaydet)
+        const lbl = score > 0 ? '🟢 OLUMLU HABER' : '🔴 OLUMSUZ HABER';
+        await sendTelegram(
+          `${lbl} — <b>${symC}</b>\n\n📰 ${it.title}\n` +
+          `Kaynak: ${it.source_info ? it.source_info.name : (it.source || '-')}\n` +
+          `Etki: ${score > 0 ? 'yükseliş yönlü olabilir 📈' : 'düşüş yönlü olabilir 📉'} (skor ${score > 0 ? '+' : ''}${score.toFixed(1)})\n\n` +
+          `<i>Bot bu haberi ${symC} sinyallerinde ${Math.abs(score) >= 2 ? 'GÜÇLÜ' : 'hafif'} etken olarak kullanacak. Yatırım tavsiyesi değildir.</i>`
+        );
+        await new Promise(res => setTimeout(res, 600));
+      }
+    }
+  } catch (e) { console.error('haber takip hatası:', e.message); }
+  _newsFirstRun = false;
+}
+function getNewsBoost(sym) {
+  const n = newsSentiment[sym];
+  if (!n || Date.now() - n.ts > 6 * 3600 * 1000) return null;
+  return n;
+}
+// ── GRAFİK GÖRÜNTÜSÜ (QuickChart — ücretsiz) + Telegram'a fotoğraf gönder ──
+async function buildChartUrl(bars, sym, tf, levels) {
+  try {
+    const data = bars.slice(-70).map(b => ({ x: b.t, o: b.o, h: b.h, l: b.l, c: b.c }));
+    const ann = {};
+    const mk = (id, y, color, label) => { if (y != null && isFinite(y)) ann[id] = { type: 'line', yMin: y, yMax: y, borderColor: color, borderWidth: 1.5, borderDash: [5, 4], label: { display: true, content: label, position: 'end', backgroundColor: color, font: { size: 9 } } }; };
+    if (levels) { mk('e', levels.entry, '#3b82f6', 'Giriş'); mk('s', levels.sl, '#ef4444', 'SL'); mk('t1', levels.tp1, '#22c55e', 'TP1'); mk('t2', levels.tp2, '#16a34a', 'TP2'); mk('t3', levels.tp3, '#15803d', 'TP3'); }
+    const cfg = {
+      type: 'candlestick',
+      data: { datasets: [{ label: `${sym} ${tf}`, data }] },
+      options: {
+        plugins: { legend: { display: true, labels: { color: '#ddd' } }, annotation: { annotations: ann } },
+        scales: { x: { type: 'timeseries', ticks: { color: '#999' }, grid: { color: 'rgba(255,255,255,.06)' } },
+                  y: { ticks: { color: '#999' }, grid: { color: 'rgba(255,255,255,.08)' } } },
+      },
+    };
+    const r = await fetch('https://quickchart.io/chart/create', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chart: cfg, width: 820, height: 440, backgroundColor: '#111418', version: '3' }),
+    });
+    const j = await r.json();
+    return (j && j.success && j.url) ? j.url : null;
+  } catch (e) { return null; }
+}
+async function sendTelegramPhoto(chatId, photoUrl, caption) {
+  try {
+    await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendPhoto`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: chatId, photo: photoUrl, caption: caption || '', parse_mode: 'HTML' }),
+    });
+  } catch (e) {}
+}
+
 // ── Telegram mesaj gönder ──
 async function sendTelegram(text) {
   const url = `https://api.telegram.org/bot${TG_TOKEN}/sendMessage`;
@@ -1364,6 +1525,14 @@ async function scanForSignals() {
       const sig = calcScalpSignal(bars, coin.price);
       if (!sig) { noData++; continue; }
 
+      // ── HABER ETKİSİ: olumlu haber sinyali güçlendirir, olumsuz haber ters yönü keser ──
+      const nb = getNewsBoost(coin.sym);
+      if (nb) {
+        if (nb.score > 0 && sig.dir === 'LONG')  { sig.confidence = Math.min(97, sig.confidence + 6); sig.signals.unshift('📰 Olumlu haber desteği: ' + nb.headline.slice(0, 60)); }
+        if (nb.score < 0 && sig.dir === 'SHORT') { sig.confidence = Math.min(97, sig.confidence + 6); sig.signals.unshift('📰 Olumsuz haber desteği (short): ' + nb.headline.slice(0, 60)); }
+        if (nb.score < -1.5 && sig.dir === 'LONG') { lowConf++; continue; }   // kötü haberde LONG açma
+      }
+
       // En yüksek güveni takip et (teşhis için)
       if (sig.confidence > bestSeen.conf) bestSeen = { sym: coin.sym, conf: sig.confidence, dir: sig.dir };
 
@@ -1660,6 +1829,33 @@ async function smartAnalyze(symbol) {
   else if (!aligned) recommendation = `${confEmoji} <b>ZAYIF</b> — Üst trende ters, bekle`;
   else recommendation = `${confEmoji} <b>NÖTR</b> — Net giriş yok`;
 
+  // ── GELİŞMİŞ BÖLÜMLER: MA kesişimleri, formasyon, arz, haber ──
+  const bars1h = isSpot ? await fetchSpotOHLC(sym, '1h') : await fetchOHLC(sym, '1h');
+  const bars4h = isSpot ? await fetchSpotOHLC(sym, '4h') : await fetchOHLC(sym, '4h');
+  let maTxt = '';
+  const gc1h = detectMACross(bars1h, 50, 200), gc4h = detectMACross(bars4h, 50, 200);
+  const kc = detectMACross(bars, 9, 21);
+  if (gc4h) maTxt += `${gc4h.type === 'golden' ? '🌟 GOLDEN CROSS (4sa)' : '💀 DEATH CROSS (4sa)'} — ${gc4h.barsAgo} mum önce\n`;
+  if (gc1h) maTxt += `${gc1h.type === 'golden' ? '🌟 Golden Cross (1sa)' : '💀 Death Cross (1sa)'} — ${gc1h.barsAgo} mum önce\n`;
+  if (kc) maTxt += `${kc.type === 'golden' ? '🟢 EMA9↑EMA21 kesişimi' : '🔴 EMA9↓EMA21 kesişimi'} (${scalpTF}, ${kc.barsAgo} mum önce)\n`;
+  if (!maTxt) maTxt = 'Yakın zamanda MA kesişimi yok\n';
+  const pat1h = detectChartPattern(bars1h) || detectChartPattern(bars);
+  const patTxt = pat1h ? `${pat1h.dir === 'LONG' ? '🟢' : '🔴'} <b>${pat1h.name}</b> tespit edildi (${pat1h.dir} yönlü)` : 'Belirgin formasyon yok';
+  const sup = await getSupplyInfo(sym);
+  const supTxt = sup && sup.notes && sup.notes.length ? sup.notes.join('\n') : 'Arz verisi bulunamadı';
+  const nws = getNewsBoost(sym);
+  let newsTxt = 'Son 6 saatte önemli haber yok';
+  if (nws) {
+    newsTxt = `${nws.score > 0 ? '🟢 OLUMLU' : '🔴 OLUMSUZ'} (skor ${nws.score > 0 ? '+' : ''}${nws.score.toFixed(1)}): ${nws.headline}`;
+    // Haber etkisini güvene kat
+    if (nws.score > 0 && sig.dir === 'LONG') finalConf = Math.min(97, finalConf + 5);
+    if (nws.score < 0 && sig.dir === 'LONG') finalConf = Math.max(10, finalConf - 8);
+    if (nws.score < 0 && sig.dir === 'SHORT') finalConf = Math.min(97, finalConf + 5);
+  }
+
+  // Grafik görüntüsü hazırla (mesajdan sonra fotoğraf olarak gönderilir)
+  global._lastChartUrl = await buildChartUrl(bars, sym, scalpTF, { entry, sl, tp1, tp2, tp3 });
+
   return `${dirEmoji} <b>${sym} AKILLI ANALİZ</b>${isSpot ? ' 🛒 <i>(SPOT — vadelide yok, kaldıraçsız)</i>' : ''}
 🎯 Önerilen scalp: <b>${scalpTF}</b> (volatiliteye göre seçildi)
 
@@ -1682,6 +1878,15 @@ ${lv.inZone ? '🟢 <b>Fiyat şu an giriş bölgesinde - işleme girilebilir</b>
 ✅ TP3: $${f(tp3)}
 
 ${isSpot ? '<b>🛒 SPOT — kaldıraç yok.</b> Yalnızca ALIM yönlü değerlendir; SHORT yapılamaz.' : `<b>⚡ Önerilen Kaldıraç: ${lv.leverage}x</b>\n<i>(Bakiyenin %${lv.riskPerTrade}'si risk · SL'de ~%${(lv.slPct*lv.leverage).toFixed(1)} kayıp)</i>`}
+
+<b>📐 MA Kesişimleri:</b>
+${maTxt}<b>📊 Formasyon:</b> ${patTxt}
+
+<b>🪙 Arz Analizi:</b>
+${supTxt}
+
+<b>📰 Haber Etkisi:</b>
+${newsTxt}
 
 <b>Sinyaller:</b>
 ${sig.signals.length ? sig.signals.slice(0,4).map(s=>'• '+s).join('\n') : '• Net sinyal yok'}
@@ -1960,6 +2165,8 @@ async function pollCommands() {
         await sendTelegramTo(chatId, `⏳ <b>${coinSym.toUpperCase()}</b> akıllı analiz ediliyor (tüm zaman dilimleri taranıyor)...`);
         const analysis = await smartAnalyze(coinSym);
         await sendTelegramTo(chatId, analysis);
+        // Mum grafiği (giriş/SL/TP seviyeleri işaretli) — analiz sonrası fotoğraf
+        if (global._lastChartUrl) { await sendTelegramPhoto(chatId, global._lastChartUrl, `📉 ${coinSym.toUpperCase()} grafik — giriş/SL/TP seviyeleri işaretli`); global._lastChartUrl = null; }
         console.log(new Date().toLocaleTimeString('tr-TR'), `- Akıllı analiz: ${coinSym} → ${chatId}`);
       } else {
         // TF YAZILDI → o spesifik TF(ler)de analiz
@@ -2023,6 +2230,11 @@ async function start() {
   // Açık pozisyonları her 30 saniyede kontrol et (SL/TP bildirimleri için)
   setInterval(monitorPositions, 30000);
   if (SPOT_COINS.length) setInterval(monitorSpotPositions, 30000);
+
+  // 📰 Canlı haber takibi — 5 dakikada bir; olumlu/olumsuz haberleri coin ile bildirir
+  newsMonitor();
+  setInterval(newsMonitor, 5 * 60 * 1000);
+  console.log('📰 Haber takibi aktif - olumlu/olumsuz haberler bildirilecek ve sinyallere katılacak');
   console.log('📍 Pozisyon takibi aktif - SL/TP geldiğinde bildirim gelecek');
 
   // Komut dinleme döngüsü (sürekli)
