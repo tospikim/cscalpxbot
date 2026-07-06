@@ -178,6 +178,7 @@ const DEX_POOLS = {};
 });
 const spotPositions = {};
 let _lastSpotSource = '';   // son başarılı spot veri kaynağı (mesajlarda gösterilir)
+const _spotCache = {};      // kısa önbellek: {key: {t, v, src}} — DEX rate limitini korur (GT: ~30 istek/dk)
 
 // SPOT mum verisi: OKX spot → Bybit spot → Binance spot → DEX (GeckoTerminal)
 const _spotTf = {
@@ -186,6 +187,15 @@ const _spotTf = {
   binance:{ '1m':'1m','5m':'5m','15m':'15m','1h':'1h','4h':'4h','1d':'1d' },
 };
 async function fetchSpotOHLC(sym, tf) {
+  // Önbellek (20 sn): aynı sembol+TF tekrar istenirse API'ye gitme (DEX rate limitini korur)
+  const ck = sym + '_' + tf;
+  const hit = _spotCache[ck];
+  if (hit && Date.now() - hit.t < 20000) { _lastSpotSource = hit.src; return hit.v; }
+  const bars = await _fetchSpotOHLCRaw(sym, tf);
+  if (bars) _spotCache[ck] = { t: Date.now(), v: bars, src: _lastSpotSource };
+  return bars;
+}
+async function _fetchSpotOHLCRaw(sym, tf) {
   // 1) OKX spot
   try {
     const bar = _spotTf.okx[tf] || '5m';
@@ -196,7 +206,7 @@ async function fetchSpotOHLC(sym, tf) {
       return d.data.reverse().map(k => ({ t:+k[0], o:+k[1], h:+k[2], l:+k[3], c:+k[4], vol:+k[5] }));
     }
   } catch (e) {}
-  // 2) Bybit spot
+  // 2) Bybit spot (not: Railway US'ten engelli olabilir)
   try {
     const iv = _spotTf.bybit[tf] || '5';
     const r = await fetch(`https://api.bybit.com/v5/market/kline?category=spot&symbol=${sym}USDT&interval=${iv}&limit=200`);
@@ -206,7 +216,7 @@ async function fetchSpotOHLC(sym, tf) {
       return d.result.list.reverse().map(k => ({ t:+k[0], o:+k[1], h:+k[2], l:+k[3], c:+k[4], vol:+k[5] }));
     }
   } catch (e) {}
-  // 3) Binance spot
+  // 3) Binance spot (not: Railway US'ten engelli olabilir)
   try {
     const iv = _spotTf.binance[tf] || '5m';
     const r = await fetch(`https://api.binance.com/api/v3/klines?symbol=${sym}USDT&interval=${iv}&limit=200`);
@@ -216,12 +226,74 @@ async function fetchSpotOHLC(sym, tf) {
       return d.map(k => ({ t:k[0], o:+k[1], h:+k[2], l:+k[3], c:+k[4], vol:+k[5] }));
     }
   } catch (e) {}
-  // 4) DEX (GeckoTerminal) — bu coin için havuz tanımlıysa
-  if (DEX_POOLS[sym]) {
-    const b = await fetchDexOHLC(DEX_POOLS[sym].network, DEX_POOLS[sym].pool, tf);
-    if (b && b.length >= 10) { _lastSpotSource = 'DEX (' + DEX_POOLS[sym].network + ')'; return b; }
+  // 4) MEXC spot (Binance uyumlu API — memecoinlerin çoğu burada listeli, geo-engel yok)
+  try {
+    const iv = _spotTf.binance[tf] || '5m';
+    const r = await fetch(`https://api.mexc.com/api/v3/klines?symbol=${sym}USDT&interval=${iv}&limit=200`);
+    const d = await r.json();
+    if (Array.isArray(d) && d.length >= 10) {
+      _lastSpotSource = 'MEXC Spot';
+      return d.map(k => ({ t:k[0], o:+k[1], h:+k[2], l:+k[3], c:+k[4], vol:+k[5] }));
+    }
+  } catch (e) {}
+  // 5) KuCoin spot
+  try {
+    const kuTf = { '1m':'1min','5m':'5min','15m':'15min','1h':'1hour','4h':'4hour','1d':'1day' }[tf] || '5min';
+    const r = await fetch(`https://api.kucoin.com/api/v1/market/candles?type=${kuTf}&symbol=${sym}-USDT`);
+    const d = await r.json();
+    if (d.code === '200000' && Array.isArray(d.data) && d.data.length >= 10) {
+      _lastSpotSource = 'KuCoin Spot';
+      // KuCoin: [time(s), open, close, high, low, volume, turnover] — en yeni önce
+      return d.data.reverse().map(k => ({ t:+k[0]*1000, o:+k[1], h:+k[3], l:+k[4], c:+k[2], vol:+k[5] })).slice(-200);
+    }
+  } catch (e) {}
+  // 6) Gate.io spot
+  try {
+    const gTf = { '1m':'1m','5m':'5m','15m':'15m','1h':'1h','4h':'4h','1d':'1d' }[tf] || '5m';
+    const r = await fetch(`https://api.gateio.ws/api/v4/spot/candlesticks?currency_pair=${sym}_USDT&interval=${gTf}&limit=200`);
+    const d = await r.json();
+    if (Array.isArray(d) && d.length >= 10) {
+      _lastSpotSource = 'Gate.io Spot';
+      // Gate: [t(s), quoteVol, close, high, low, open, baseVol, ...] — eski→yeni
+      return d.map(k => ({ t:+k[0]*1000, o:+k[5], h:+k[3], l:+k[4], c:+k[2], vol:+k[6] }));
+    }
+  } catch (e) {}
+  // 7) DEX (GeckoTerminal) — manuel tanımlı YA DA otomatik bulunmuş havuz
+  let poolInfo = DEX_POOLS[sym];
+  if (!poolInfo) poolInfo = await findDexPool(sym);   // OTOMATİK: en likit havuzu ara-bul
+  if (poolInfo) {
+    const b = await fetchDexOHLC(poolInfo.network, poolInfo.pool, tf);
+    if (b && b.length >= 10) { _lastSpotSource = 'DEX (' + poolInfo.network + ')'; return b; }
   }
   return null;
+}
+// ── OTOMATİK DEX HAVUZ BULMA (GeckoTerminal arama, ücretsiz) ──
+// Coin hiçbir CEX'te yoksa: sembolü arar, ismi eşleşen EN LİKİT havuzu bulur, önbelleğe alır.
+const _dexSearchCache = {};   // { SYM: {network,pool} | null }
+async function findDexPool(sym) {
+  if (sym in _dexSearchCache) return _dexSearchCache[sym];
+  try {
+    const r = await fetch(`https://api.geckoterminal.com/api/v2/search/pools?query=${encodeURIComponent(sym)}&page=1`);
+    const d = await r.json();
+    const pools = (d && d.data) || [];
+    let best = null, bestLiq = 0;
+    for (const p of pools) {
+      const at = p.attributes || {};
+      const name = String(at.name || '').toUpperCase();
+      // Havuz adı "SYM / ..." ile başlamalı (yanlış coin eşleşmesin)
+      if (!name.startsWith(sym + ' /') && !name.startsWith(sym + '/')) continue;
+      const liq = parseFloat(at.reserve_in_usd || '0') || 0;
+      if (liq < 10000) continue;             // çok sığ havuzları alma (min $10k likidite)
+      if (liq > bestLiq) {
+        // id formatı: "network_pooladdress"
+        const id = String(p.id || ''); const us = id.indexOf('_');
+        if (us > 0) { best = { network: id.slice(0, us), pool: id.slice(us + 1) }; bestLiq = liq; }
+      }
+    }
+    _dexSearchCache[sym] = best;
+    if (best) console.log(`🔎 DEX havuzu otomatik bulundu: ${sym} → ${best.network}/${best.pool} ($${Math.round(bestLiq).toLocaleString()} likidite)`);
+    return best;
+  } catch (e) { _dexSearchCache[sym] = null; return null; }
 }
 // DEX mum verisi (GeckoTerminal, ücretsiz, key gerekmez)
 async function fetchDexOHLC(network, pool, tf) {
@@ -1522,7 +1594,7 @@ async function smartAnalyze(symbol) {
     isSpot = true;
     if (!bars || bars.length < 30) {
       return `❌ <b>${sym}</b> için veri bulunamadı.\n\n` +
-        `Vadeli VE spot piyasalarda (OKX/Bybit/Binance${DEX_POOLS[sym] ? '/DEX' : ''}) bulunamadı.\n` +
+        `Vadeli VE spot piyasalarda (OKX/Bybit/Binance/MEXC/KuCoin/Gate + DEX otomatik arama) bulunamadı.\n` +
         `• Coin ismini kontrol et\n• /list ile mevcut coinleri gör\n` +
         `• DEX coini ise Railway'de DEX_POOLS değişkenine havuz ekle`;
     }
@@ -1632,7 +1704,7 @@ async function analyzeCoinForCommand(symbol, tf) {
   }
   if (!bars || bars.length < 30) {
     return `❌ <b>${sym}</b> için veri bulunamadı.\n\n` +
-      `Vadeli VE spot piyasalarda (Binance/Bybit/OKX${DEX_POOLS[sym] ? '/DEX' : ''}) bulunamadı.\n\n` +
+      `Vadeli VE spot piyasalarda (Binance/Bybit/OKX/MEXC/KuCoin/Gate + DEX otomatik arama) bulunamadı.\n\n` +
       `• Coin ismini kontrol et (örn: BTC, ETH, SOL, DOGE, PEPE)\n` +
       `• USDT ekleme, sadece coin yaz\n` +
       `• Sadece DEX'te işlem gören coin ise Railway'de <code>DEX_POOLS</code> değişkenine havuz ekle (README'de anlatıldı)`;
