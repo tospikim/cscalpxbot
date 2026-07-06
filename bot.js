@@ -202,7 +202,7 @@ async function fetchMexcHotSpot() {
         && !_lvrToken.test(c.sym) && !_stables.has(c.sym)
         && !SYMBOL_REGISTRY.okx[c.sym] && !SYMBOL_REGISTRY.binance[c.sym] && !SYMBOL_REGISTRY.bybit[c.sym]);  // vadelide varsa atla
     // TÜM evren (ölü çiftler hariç, min $300k hacim) — dönüşümlü tam tarama için sakla
-    global._mexcAll = filtered.filter(c => c.vol > 300000).map(c => c.sym);
+    global._mexcAll = filtered.filter(c => c.vol > 1000000).map(c => c.sym);
     // Sıcak liste (hızlı tepki): min $2M hacim, en hareketli 25
     return filtered.filter(c => c.vol > SPOT_SCAN.minVol)
       .map(c => ({ ...c, score: Math.abs(c.chg24) * 1.5 + (c.vol / 1e9) * 0.5 }))
@@ -1510,6 +1510,7 @@ async function scanSpotWatchlist() {
   for (const sym of list) {
     try {
       if (spotPositions[sym]) continue;                 // zaten alımdayız
+      if (pendingSpotSetups[sym]) continue;             // kurulum zaten bekleniyor
       const manual = SPOT_COINS.includes(sym);
       // Otomatik coinlerde HIZLI ÖN FİLTRE (15m) — ancak umut varsa tam çoklu-TF taraması yap
       if (!manual) {
@@ -1523,9 +1524,12 @@ async function scanSpotWatchlist() {
       const tfW = { '5m': 0, '15m': 2, '1h': 5, '4h': 9, '1d': 14 };
       let best = null;
       for (const tf of ['5m', '15m', '1h', '4h', '1d']) {
-        const bars = await fetchSpotOHLC(sym, tf);
-        if (!bars || bars.length < 30) continue;
-        const price = bars[bars.length - 1].c;
+        const raw = await fetchSpotOHLC(sym, tf);
+        if (!raw || raw.length < 31) continue;
+        // GÜNLÜK KAPANIŞ TEYİDİ: 1gün (ve 4sa) sinyali KAPANMIŞ muma göre hesapla —
+        // henüz kapanmamış mumla erken/yalancı sinyal verilmesin
+        const bars = (tf === '1d' || tf === '4h') ? raw.slice(0, -1) : raw;
+        const price = raw[raw.length - 1].c;   // anlık fiyat yine canlı
         const sig = calcScalpSignal(bars, price);
         if (!sig || sig.dir !== 'LONG') continue;        // SPOT: yalnızca ALIM
         if (sig.confidence < CONFIG.minConfidence - 5) continue;
@@ -1557,33 +1561,71 @@ async function scanSpotWatchlist() {
 
       alarmHistory[key] = now;
       const dec = price > 100 ? 2 : price > 1 ? 4 : 6;
-      spotPositions[sym] = {
-        sym, entry: lv.entry, sl: lv.sl, tp1: lv.tp1, tp2: lv.tp2, tp3: lv.tp3,
-        entryZoneLow: lv.entryZoneLow, entryZoneHigh: lv.entryZoneHigh,
-        openTime: now, tpHit: [], filled: lv.inZone, dec, learnCtx: ctxL,
-      };
       const f = v => v.toLocaleString('tr-TR', { minimumFractionDigits: dec, maximumFractionDigits: dec });
-      await sendTelegram(
-        `🟢🛒 <b>SPOT ALIM FIRSATI — ${sym}</b> <i>(kaldıraçsız)</i>\n\n` +
+      const msgOf = (pfx) => (
+        `🟢🛒 <b>${pfx} — ${sym}</b> <i>(kaldıraçsız)</i>\n\n` +
         `⏱️ <b>En güvenli konum: ${bestTf}</b> grafiğinde bulundu${best.maNote ? '\n📐 ' + best.maNote : ''}\n` +
-        `💰 Anlık fiyat: <b>$${f(price)}</b>\n` +
         `🎯 Güven: <b>%${sig.confidence}</b> (skor ${Math.round(best.score)})\n\n` +
         `<b>📍 Alım bölgesi:</b>\n$${f(lv.entryZoneLow)} — $${f(lv.entryZoneHigh)}\n` +
         `▫️ İdeal alım: $${f(lv.entry)}\n` +
         `🎯 Sat hedefleri: TP1 $${f(lv.tp1)} · TP2 $${f(lv.tp2)} · TP3 $${f(lv.tp3)}\n` +
         `🛑 Zarar durdur (sat): $${f(lv.sl)} (${lv.slPct.toFixed(2)}%)\n\n` +
         `<b>Sinyaller:</b>\n${sig.signals.slice(0, 4).map(s => '• ' + s).join('\n')}\n\n` +
-        `${lv.inZone ? '🟢 <i>Fiyat şu an alım bölgesinde.</i>' : `🟡 <i>Alım bölgesine ${lv.distToZone.toFixed(2)}% uzakta. Limit alım koy.</i>`}\n` +
-        `⚠️ <i>Spot alım — kaldıraç yok. Yatırım tavsiyesi değildir.</i>`
-      );
-      console.log(new Date().toLocaleTimeString('tr-TR'), `- 🛒 SPOT ALIM: ${sym} %${sig.confidence}`);
-      await new Promise(r => setTimeout(r, 800));
+        `🟢 <i>Fiyat ŞU AN alım bölgesinde — sinyal bu yüzden şimdi verildi.</i>\n` +
+        `⚠️ <i>Spot alım — kaldıraç yok. Yatırım tavsiyesi değildir.</i>`);
+      if (lv.inZone) {
+        // Fiyat ZATEN alım seviyesinde → sinyali ŞİMDİ ver
+        spotPositions[sym] = {
+          sym, entry: lv.entry, sl: lv.sl, tp1: lv.tp1, tp2: lv.tp2, tp3: lv.tp3,
+          entryZoneLow: lv.entryZoneLow, entryZoneHigh: lv.entryZoneHigh,
+          openTime: now, tpHit: [], filled: true, dec, learnCtx: ctxL,
+        };
+        await sendTelegram(msgOf('SPOT ALIM FIRSATI'));
+        console.log(new Date().toLocaleTimeString('tr-TR'), `- 🛒 SPOT ALIM: ${sym} %${sig.confidence}`);
+      } else {
+        // Fiyat alım seviyesinde DEĞİL → SİNYAL YOK; sessizce BEKLEYEN kuruluma al.
+        // Fiyat bölgeye GELİNCE sinyal gidecek (erken/oynanmış sinyal verilmez).
+        pendingSpotSetups[sym] = {
+          sym, bestTf, dec, learnCtx: ctxL, created: now,
+          entry: lv.entry, sl: lv.sl, tp1: lv.tp1, tp2: lv.tp2, tp3: lv.tp3,
+          entryZoneLow: lv.entryZoneLow, entryZoneHigh: lv.entryZoneHigh,
+          msg: msgOf('SPOT ALIM SEVİYESİNE GELDİ'), key,
+        };
+        console.log(new Date().toLocaleTimeString('tr-TR'), `- ⏳ spot ${sym}: kurulum bekleniyor (bölgeye %${lv.distToZone.toFixed(2)} uzak)`);
+      }
+      await new Promise(r => setTimeout(r, 400));
     } catch (e) { console.error(`spot ${sym} hata:`, e.message); }
   }
 }
 
 // SPOT pozisyon takibi — alım dolunca + satış (TP/zarar durdur/aşırı alım) sinyalleri
+const pendingSpotSetups = {};   // fiyatın alım bölgesine gelmesi BEKLENEN kurulumlar
 async function monitorSpotPositions() {
+  // ── BEKLEYEN KURULUMLAR: fiyat alım bölgesine GELDİ Mİ? ──
+  for (const sym of Object.keys(pendingSpotSetups)) {
+    const p = pendingSpotSetups[sym];
+    try {
+      const bars = await fetchSpotOHLC(sym, '5m');
+      if (!bars || !bars.length) continue;
+      const cur = bars[bars.length - 1]; const price = cur.c, low = cur.l, high = cur.h;
+      if (low <= p.entryZoneHigh && high >= p.entryZoneLow) {
+        // 🎯 Fiyat alım bölgesine GELDİ → sinyali ŞİMDİ ver + pozisyon takibine al
+        spotPositions[sym] = { sym, entry: p.entry, sl: p.sl, tp1: p.tp1, tp2: p.tp2, tp3: p.tp3,
+          entryZoneLow: p.entryZoneLow, entryZoneHigh: p.entryZoneHigh,
+          openTime: Date.now(), tpHit: [], filled: true, dec: p.dec, learnCtx: p.learnCtx };
+        await sendTelegram(p.msg);
+        delete pendingSpotSetups[sym];
+      } else if (high >= p.tp1) {
+        // Kurulum KAÇTI (bölgeye uğramadan hedefe gitti) → sinyal yok, ama dedupe'u TEMİZLE
+        // ki benzer yeni oluşum bir daha kaçırılmasın (hemen tekrar yakalanabilsin)
+        delete alarmHistory[p.key]; delete pendingSpotSetups[sym];
+        console.log(`⏳→✈️ spot ${sym}: kurulum kaçtı, benzer oluşum için tekrar izlemede`);
+      } else if (low <= p.sl || Date.now() - p.created > 24 * 3600 * 1000) {
+        // Kurulum bozuldu (SL altına indi) veya 24 saatte gelmedi → iptal + dedupe temizle
+        delete alarmHistory[p.key]; delete pendingSpotSetups[sym];
+      }
+    } catch (e) {}
+  }
   const syms = Object.keys(spotPositions);
   for (const sym of syms) {
     const pos = spotPositions[sym];
