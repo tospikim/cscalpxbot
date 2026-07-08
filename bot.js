@@ -30,7 +30,7 @@ const TRADE = {
   live: clean(process.env.LIVE_TRADING) === 'true',
   riskPerTrade: 2,          // her işlemde bakiyenin %2'si risk
   dailyLossLimit: 10,       // günlük -%10 zararda bot durur
-  maxOpenPositions: 0,      // 0 = limitsiz
+  maxOpenPositions: 6,      // ayni anda en fazla 6 gercek pozisyon (0 = limitsiz)
   tdMode: 'isolated',       // izole marjin (cross değil - daha güvenli)
 };
 
@@ -49,16 +49,18 @@ console.log('🔍 Chat ID:', JSON.stringify(TG_CHAT_ID), '| uzunluk:', TG_CHAT_I
 
 // Ayarlar
 const CONFIG = {
-  minConfidence:   70,        // Min sinyal güveni (%) - 75'ten 70'e düşürüldü
+  minConfidence:   80,        // Min sinyal güveni (%) — panel kalitesine çekildi (70 çok gevşekti → çok SL)
   minVolume:       50000000,  // (eski - kullanılmıyor)
   scanMaxDetailed: 80,        // Hacim filtresinden sonra kaç coin detaylı taranacak
-  minScanVolume:   15000000,  // Tarama için min 24s hacim ($15M)
+  minScanVolume:   25000000,  // Tarama için min 24s hacim ($25M) — cansız/manipüle coin eleme
   scanInterval:    300000,    // Tarama sıklığı (ms) = 5 dakika
-  dedupeMinutes:   30,        // Aynı coin için tekrar uyarı engeli (dk)
+  dedupeMinutes:   45,        // Aynı coin için tekrar uyarı engeli (dk)
   scalpTF:         '5m',      // Scalp zaman dilimi
   requireBacktest: true,      // Backtest kârlı olmalı mı
-  minWinRate:      45,        // Min backtest kazanma oranı (%) - 50'den 45'e
-  minBacktestTrades: 2,       // Min backtest işlem sayısı - 3'ten 2'ye
+  minWinRate:      55,        // Min backtest kazanma oranı (%) — 45 çok düşüktü
+  minBacktestTrades: 3,       // Min backtest işlem sayısı
+  maxOpenPositions: 6,        // Aynı anda en fazla açık vadeli pozisyon (0 = limitsiz)
+  maxNewPerScan:   2,         // Her taramada en fazla yeni sinyal (kalite > miktar)
 };
 
 const alarmHistory = {};
@@ -126,17 +128,20 @@ function recurringBlock(ctx) {
 }
 // ANA ÖĞRENME KAPISI — girişe izin (null) ya da engel sebebi (string)
 function learnBlock(ctx) {
-  // 1) TREND KARŞITI + üst TF güçlü ters yönde → engelle (en sık SL sebebi)
-  //    Ama bu kategori kanıtlanmış kazançlıysa (≥%55, ≥5 örnek) izin ver.
+  // 1) TREND KARŞITI → HER ZAMAN engelle (panelde en sık SL sebebiydi).
+  //    Tek istisna: bu kategori KANITLANMIŞ kazançlıysa (≥%55, ≥5 örnek).
   if (ctx.ct) {
     const b = bucketWR(ctx.dir, ctx.htf);
     if (!(b.n >= 5 && b.wr != null && b.wr >= 55)) return 'trend karşıtı (üst TF ters yönde)';
   }
   // 2) Aynı coin+yön yakın zamanda kaybettirdi → tekrar girme
   if (recentLoss(ctx.sym, ctx.dir)) return 'bu coin+yön yakında SL oldu';
-  // 3) Tekrar eden hata özelliği
+  // 3) COIN KARA LİSTESİ: bu coin (yön farketmez) son 12 sonuçta 2+ kez kaybettirdiyse girme
+  const last12 = learnLog.slice(-12).filter(e => e.sym === ctx.sym);
+  if (last12.filter(e => e.result === 'loss').length >= 2) return 'coin kara listede (son işlemlerde 2+ SL)';
+  // 4) Tekrar eden hata özelliği
   const rb = recurringBlock(ctx); if (rb) return rb;
-  // 4) Kategori geçmişi zayıf (yeterli örnekle)
+  // 5) Kategori geçmişi zayıf (yeterli örnekle)
   const b = bucketWR(ctx.dir, ctx.htf);
   if (b.n >= 5 && b.wr != null && b.wr < 35) return 'kategori zayıf (%' + Math.round(b.wr) + ', ' + b.n + ' işlem)';
   return null;
@@ -219,7 +224,7 @@ const _spotCache = {};      // kısa önbellek: {key: {t, v, src}} — DEX rate 
 // Tüm MEXC spot coinlerini hacim+hareket ile filtreler, en sıcakları döner.
 // Vadelide (OKX/Binance/Bybit) zaten izlenen coinler ATLANIR (çift sinyal olmasın) —
 // yani bu tarama, SADECE spotta listeli coinleri (memecoinler vb.) yakalar.
-const SPOT_SCAN = { minVol: 2000000, top: 25 };   // min $2M 24s hacim, en iyi 25 coin
+const SPOT_SCAN = { minVol: 3000000, top: 15 };   // min $3M 24s hacim, en iyi 15 (cansiz coin girme)
 const _lvrToken = /(3L|3S|5L|5S|2L|2S|4L|4S)$/;
 const _stables = new Set(['USDC','TUSD','DAI','FDUSD','USDE','PYUSD','USDD','EURT','USD1']);
 async function fetchMexcHotSpot() {
@@ -1551,8 +1556,16 @@ async function scanSpotWatchlist() {
       if (!manual) {
         const qb = await fetchSpotOHLC(sym, '15m');
         if (!qb || qb.length < 30) continue;
+        // ── CANSIZ COİN FİLTRESİ: yanıltıcı ölü grafiklerde işleme girme ──
+        // (a) Son 30 mumun %25+'ı sıfır hacimliyse ölü. (b) Volatilite (ATR%) < 0.12 ise cansız/manipüle riski.
+        const son30 = qb.slice(-30);
+        const bosMum = son30.filter(b => !b.vol || b.vol <= 0).length;
+        if (bosMum > 7) continue;
+        const atrp = (atr14 => atr14 / son30[son30.length - 1].c * 100)(
+          son30.slice(-15).reduce((s, b, i, a) => i ? s + Math.max(b.h - b.l, Math.abs(b.h - a[i-1].c), Math.abs(b.l - a[i-1].c)) : s, 0) / 14);
+        if (!isFinite(atrp) || atrp < 0.12) continue;
         const qs = calcScalpSignal(qb, qb[qb.length - 1].c);
-        if (!qs || qs.dir !== 'LONG' || qs.confidence < CONFIG.minConfidence - 12) continue;
+        if (!qs || qs.dir !== 'LONG' || qs.confidence < CONFIG.minConfidence - 8) continue;
       }
       // ── ÇOKLU-TF DEĞERLENDİRME: tüm TF'lerde ALIM sinyali ara, EN GÜVENLİSİNİ seç ──
       // Uzun vadeli TF sinyali daha güçlü/güvenli sayılır (1gün > 4sa > 1sa > 15dk > 5dk)
@@ -1771,6 +1784,22 @@ async function scanForSignals() {
 
       // AÇIK POZİSYON KONTROLÜ: bu coinde zaten açık pozisyon varsa yeni sinyal verme
       if (openPositions[coin.sym]) { hasOpen++; continue; }
+
+      // ── POZİSYON TAVANI + TARAMA BAŞINA LİMİT (kalite > miktar; aşırı işlem = aşırı SL) ──
+      if (CONFIG.maxOpenPositions > 0 && Object.keys(openPositions).length >= CONFIG.maxOpenPositions) { hasOpen++; continue; }
+      if (found >= CONFIG.maxNewPerScan) { deduped++; continue; }
+
+      // ── MOMENTUM FİLTRESİ (panelden): son 3 mum sinyale TERS akıyorsa girme ──
+      // LONG'da fiyat hâlâ düşüyorsa "düşen bıçak", SHORT'ta hâlâ yükseliyorsa tepe kovalamak olur.
+      const son4 = bars.slice(-4);
+      if (son4.length >= 4) {
+        const mom = (son4[3].c - son4[0].c) / son4[0].c * 100;
+        if (sig.dir === 'LONG' && mom < -0.3) { lowConf++; continue; }
+        if (sig.dir === 'SHORT' && mom > 0.3) { lowConf++; continue; }
+      }
+
+      // ── GİRİŞ MESAFESİ: giriş bölgesi çok uzaksa güvenilmez (panel: >%1 ele) ──
+      if (!lv.inZone && lv.distToZone > 0.8) { unreachable++; continue; }
 
       // ── ÖĞRENME KAPISI: daha az SL için trend/geçmiş filtreleri ──
       const htf = await getMultiTFBias(coin.sym).catch(() => null);
