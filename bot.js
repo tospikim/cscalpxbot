@@ -94,9 +94,10 @@ function isCounterTrend(dir, htf) {
   return (b === 'LONG' && dir === 'SHORT') || (b === 'SHORT' && dir === 'LONG');
 }
 // Sonuç kaydet (win/loss) — pozisyon kapanınca çağrılır
-function recordOutcome(ctx, result) {
+function recordOutcome(ctx, result, extra) {
   if (!ctx) return;
-  learnLog.push({ sym: ctx.sym, dir: ctx.dir, htf: ctx.htf, ct: ctx.ct ? 1 : 0, conf: ctx.conf, dist: ctx.dist, result, t: Date.now() });
+  learnLog.push({ sym: ctx.sym, dir: ctx.dir, htf: ctx.htf, ct: ctx.ct ? 1 : 0, conf: ctx.conf, dist: ctx.dist,
+    spot: ctx.spot ? 1 : 0, tp: (extra && extra.tp) || 0, result, t: Date.now() });
   if (learnLog.length > 2000) learnLog = learnLog.slice(-2000);
   saveLearning();
   console.log(`🧠 Sonuç kaydedildi: ${ctx.sym} ${ctx.dir} → ${result} (toplam ${learnLog.length})`);
@@ -161,6 +162,40 @@ function learnSummary() {
     `• Trend karşıtı: ${ctLoss} kez` + (ctLoss >= 3 ? ' → artık bloklanıyor ✓' : '') + '\n' +
     `• Düşük güven (<%75): ${lowLoss} kez` + (lowLoss >= 3 ? ' → artık bloklanıyor ✓' : '') + '\n\n' +
     (catTxt ? '<b>Kategori performansı:</b>\n' + catTxt : '');
+}
+// ── /istatistik — açılan/kapanan işlem sayıları, kazanç/kayıp dökümü ──
+function tradeStats() {
+  const total = learnLog.length;
+  const wins = learnLog.filter(e => e.result === 'win');
+  const losses = learnLog.filter(e => e.result === 'loss');
+  const wr = total ? Math.round(wins.length / total * 100) : 0;
+  const fut = learnLog.filter(e => !e.spot), spt = learnLog.filter(e => e.spot);
+  const fw = fut.filter(e => e.result === 'win').length, sw = spt.filter(e => e.result === 'win').length;
+  const tp3 = wins.filter(e => e.tp >= 3).length, tp2 = wins.filter(e => e.tp === 2).length, tp1 = wins.filter(e => e.tp === 1).length;
+  // Son 24 saat
+  const day = learnLog.filter(e => Date.now() - e.t < 24 * 3600 * 1000);
+  const dw = day.filter(e => e.result === 'win').length;
+  // Açık işlemler
+  const openF = Object.keys(openPositions).length, openS = Object.keys(spotPositions).length;
+  const pend = Object.keys(pendingSpotSetups).length;
+  // Son 5 kapanan işlem
+  let son = '';
+  learnLog.slice(-5).reverse().forEach(e => {
+    const dt = new Date(e.t).toLocaleString('tr-TR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
+    son += `${e.result === 'win' ? '✅' : '🛑'} ${e.sym} ${e.dir}${e.spot ? ' (spot)' : ''}${e.tp ? ' TP' + e.tp : ''} · ${dt}\n`;
+  });
+  return '📊 <b>İŞLEM İSTATİSTİKLERİ</b>\n\n' +
+    `<b>Kapanan işlem:</b> ${total}\n` +
+    `✅ Kazanan: <b>${wins.length}</b> · 🛑 Kaybeden (SL): <b>${losses.length}</b>\n` +
+    `🎯 Başarı oranı: <b>%${wr}</b>\n` +
+    (wins.length ? `TP dağılımı: TP1 ${tp1} · TP2 ${tp2} · TP3 ${tp3}\n` : '') +
+    `\n<b>Vadeli:</b> ${fut.length} işlem (${fw}✅/${fut.length - fw}🛑${fut.length ? ' · %' + Math.round(fw / fut.length * 100) : ''})\n` +
+    `<b>Spot:</b> ${spt.length} işlem (${sw}✅/${spt.length - sw}🛑${spt.length ? ' · %' + Math.round(sw / spt.length * 100) : ''})\n` +
+    `\n<b>Son 24 saat:</b> ${day.length} işlem (${dw}✅/${day.length - dw}🛑)\n` +
+    `\n<b>Şu an:</b> ${openF} vadeli + ${openS} spot pozisyon açık · ${pend} kurulum bekliyor\n` +
+    (son ? `\n<b>Son kapananlar:</b>\n${son}` : '') +
+    (total === 0 ? '\n<i>Henüz kapanmış işlem yok — pozisyonlar TP/SL ile kapandıkça burada birikecek.</i>' : '') +
+    '\n<i>Not: sayaçlar bu sürümün kurulumundan itibaren tutulur; deploy sıfırlamalarına karşı Volume önerilir (README).</i>';
 }
 
 
@@ -1480,7 +1515,7 @@ async function monitorPositions() {
 
       if (closePos) {
         // ── ÖĞRENME: sonucu kaydet (TP'ye ulaştıysa kazanç, hiç TP yoksa SL=kayıp) ──
-        recordOutcome(pos.learnCtx, pos.tpHit.length > 0 ? 'win' : 'loss');
+        recordOutcome(pos.learnCtx, pos.tpHit.length > 0 ? "win" : "loss", { tp: pos.tpHit.length ? Math.max(...pos.tpHit) : 0 });
         delete openPositions[sym];
       }
     } catch (e) {
@@ -1669,7 +1704,7 @@ async function monitorSpotPositions() {
           if (rsi > 78) { pos.warnedRsi = true; await sendTelegram(`⚠️ <b>${sym}</b> RSI aşırı alımda (${Math.round(rsi)}). Kârda satmayı düşün — dönüş yakın olabilir.`); }
         }
       }
-      if (close) { recordOutcome(pos.learnCtx, result || 'loss'); delete spotPositions[sym]; }
+      if (close) { recordOutcome(pos.learnCtx, result || "loss", { tp: pos.tpHit.length ? Math.max(...pos.tpHit) : 0 }); delete spotPositions[sym]; }
     } catch (e) { console.error(`spot takip ${sym} hata:`, e.message); }
   }
 }
@@ -2266,6 +2301,12 @@ async function pollCommands() {
         continue;
       }
 
+      // /istatistik — açılan/kapanan işlemler, kazanç/kayıp sayıları
+      if (text === '/istatistik' || text === '/stats' || text === '/stat') {
+        await sendTelegramTo(chatId, tradeStats());
+        continue;
+      }
+
       // /spot komutu - spot izleme listesi + açık spot pozisyonları
       if (text === '/spot') {
         let m = '🛒 <b>SPOT (kaldıraçsız) izleme</b>\n\n';
@@ -2310,6 +2351,7 @@ async function pollCommands() {
           '📋 <code>/coins</code> — kaç coin var gör\n' +
           '📜 <code>/list</code> — mevcut coinleri listele\n' +
           '🧠 <code>/ogrenme</code> — bot ne öğrendi (SL azaltma)\n' +
+          '📊 <code>/istatistik</code> — kazanç/kayıp işlem sayıları\n' +
           '🛒 <code>/spot</code> — spot (kaldıraçsız) izleme listesi\n' +
           '📊 <code>/positions</code> — açık pozisyonları gör\n' +
           '✖️ <code>/kapat BTC</code> — pozisyonu takipten çıkar\n' +
