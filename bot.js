@@ -2170,7 +2170,14 @@ async function smartAnalyze(symbol, forceFutures) {
   }
 
   const price = bars[bars.length-1].c;
-  const sig = calcScalpSignal(bars, price);
+  let sig = calcScalpSignal(bars, price);
+  // Net scalp kurulumu yoksa ÇÖKME — genel trend görünümüyle devam et (nötr sinyal)
+  if (!sig) {
+    const rNow = (a => a[a.length-1] || null)(rsiArr(bars.map(b => b.c), 14));
+    sig = { dir: bias.dominantBias === 'SHORT' ? 'SHORT' : 'LONG', confidence: 35,
+      signals: ['Şu an net scalp kurulumu yok — genel trend görünümü sunuluyor'],
+      rsiNow: rNow, orderFlow: null };
+  }
   const bt  = backtestScalp(bars, scalpTF);
   if (!sig) return `❌ <b>${sym}</b> analiz edilemedi.`;
 
@@ -2572,7 +2579,7 @@ async function pollCommands() {
         // ── "COIN spot" → UZUN VADE HODL/DCA ANALİZİ (günlük+haftalık dip + kademeli alım planı) ──
         const symU = coinSym.toUpperCase().replace('USDT', '');
         await sendTelegramTo(chatId, `⏳ <b>${symU}</b> uzun vade SPOT analizi yapılıyor (günlük/haftalık dip + kademeli alım planı)...`);
-        const plan = await dcaPlan(symU);
+        let plan = null; try { plan = await dcaPlan(symU); } catch (e) { await sendTelegramTo(chatId, "⚠️ HODL analiz hatası: <code>" + (e.message || e) + "</code>"); console.error("dcaPlan hata:", e); continue; }
         if (!plan) { await sendTelegramTo(chatId, `❌ <b>${symU}</b> için yeterli günlük spot verisi bulunamadı.`); continue; }
         const supInfo = await getSupplyInfo(symU).catch(() => null);
         await sendTelegramTo(chatId, hodlMessage(symU, plan, supInfo));
@@ -2584,7 +2591,9 @@ async function pollCommands() {
         // TF YAZILMADI → akıllı analiz (en uygun scalp TF + tüm TF trend uyumu)
         // "vadeli" yazıldıysa spot önceliği ATLANIR, doğrudan vadeli analiz yapılır
         await sendTelegramTo(chatId, `⏳ <b>${coinSym.toUpperCase()}</b> ${wantVadeli ? 'VADELİ' : 'akıllı'} analiz ediliyor (tüm zaman dilimleri taranıyor)...`);
-        const analysis = await smartAnalyze(coinSym, wantVadeli);
+        let analysis;
+        try { analysis = await smartAnalyze(coinSym, wantVadeli); }
+        catch (e) { analysis = '⚠️ Analiz sırasında hata oluştu: <code>' + (e.message || e) + '</code>\nTekrar dene; sürerse bu mesajı ilet.'; console.error('smartAnalyze hata:', e); }
         await sendTelegramTo(chatId, analysis);
         // Mum grafiği (giriş/SL/TP seviyeleri işaretli) — analiz sonrası fotoğraf
         if (global._lastChartUrl) { await sendTelegramPhoto(chatId, global._lastChartUrl, `📉 ${coinSym.toUpperCase()} grafik — giriş/SL/TP seviyeleri işaretli`); global._lastChartUrl = null; }
@@ -2594,7 +2603,7 @@ async function pollCommands() {
         if (tfs.length > 5) tfs = tfs.slice(0, 5);
         await sendTelegramTo(chatId, `⏳ <b>${coinSym.toUpperCase()}</b> analiz ediliyor (${tfs.join(', ')})...`);
         for (const tf of tfs) {
-          const analysis = await analyzeCoinForCommand(coinSym, tf, wantVadeli);
+          let analysis; try { analysis = await analyzeCoinForCommand(coinSym, tf, wantVadeli); } catch (e) { analysis = "⚠️ Analiz hatası (" + tf + "): <code>" + (e.message || e) + "</code>"; console.error("perTF hata:", e); }
           await sendTelegramTo(chatId, analysis);
           // Bu TF'nin mum grafiği (giriş/SL/TP işaretli)
           if (global._lastChartUrl) { await sendTelegramPhoto(chatId, global._lastChartUrl, `📉 ${coinSym.toUpperCase()} ${tf} grafik`); global._lastChartUrl = null; }
