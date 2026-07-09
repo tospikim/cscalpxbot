@@ -257,20 +257,23 @@ const _spotTf = {
   bybit:  { '1m':'1','5m':'5','15m':'15','1h':'60','4h':'240','1d':'D','1w':'W' },
   binance:{ '1m':'1m','5m':'5m','15m':'15m','1h':'1h','4h':'4h','1d':'1d','1w':'1w' },
 };
-async function fetchSpotOHLC(sym, tf) {
-  // Önbellek (20 sn): aynı sembol+TF tekrar istenirse API'ye gitme (DEX rate limitini korur)
-  const ck = sym + '_' + tf;
+async function fetchSpotOHLC(sym, tf, limit) {
+  limit = limit || 200;
+  // Önbellek (20 sn): aynı sembol+TF+limit tekrar istenirse API'ye gitme (DEX rate limitini korur)
+  const ck = sym + '_' + tf + '_' + limit;
   const hit = _spotCache[ck];
   if (hit && Date.now() - hit.t < 20000) { _lastSpotSource = hit.src; return hit.v; }
-  const bars = await _fetchSpotOHLCRaw(sym, tf);
+  const bars = await _fetchSpotOHLCRaw(sym, tf, limit);
   if (bars) _spotCache[ck] = { t: Date.now(), v: bars, src: _lastSpotSource };
   return bars;
 }
-async function _fetchSpotOHLCRaw(sym, tf) {
+async function _fetchSpotOHLCRaw(sym, tf, limit) {
+  limit = limit || 200;
+  const L = (max) => Math.min(limit, max);
   // 1) OKX spot
   try {
     const bar = _spotTf.okx[tf] || '5m';
-    const r = await fetch(`https://www.okx.com/api/v5/market/candles?instId=${sym}-USDT&bar=${bar}&limit=200`);
+    const r = await fetch(`https://www.okx.com/api/v5/market/candles?instId=${sym}-USDT&bar=${bar}&limit=${L(300)}`);
     const d = await r.json();
     if (d.code === '0' && d.data && d.data.length >= 10) {
       _lastSpotSource = 'OKX Spot';
@@ -280,7 +283,7 @@ async function _fetchSpotOHLCRaw(sym, tf) {
   // 2) Bybit spot (not: Railway US'ten engelli olabilir)
   try {
     const iv = _spotTf.bybit[tf] || '5';
-    const r = await fetch(`https://api.bybit.com/v5/market/kline?category=spot&symbol=${sym}USDT&interval=${iv}&limit=200`);
+    const r = await fetch(`https://api.bybit.com/v5/market/kline?category=spot&symbol=${sym}USDT&interval=${iv}&limit=${L(1000)}`);
     const d = await r.json();
     if (d.retCode === 0 && d.result && d.result.list && d.result.list.length >= 10) {
       _lastSpotSource = 'Bybit Spot';
@@ -290,7 +293,7 @@ async function _fetchSpotOHLCRaw(sym, tf) {
   // 3) Binance spot (not: Railway US'ten engelli olabilir)
   try {
     const iv = _spotTf.binance[tf] || '5m';
-    const r = await fetch(`https://api.binance.com/api/v3/klines?symbol=${sym}USDT&interval=${iv}&limit=200`);
+    const r = await fetch(`https://api.binance.com/api/v3/klines?symbol=${sym}USDT&interval=${iv}&limit=${L(1000)}`);
     const d = await r.json();
     if (Array.isArray(d) && d.length >= 10) {
       _lastSpotSource = 'Binance Spot';
@@ -300,7 +303,7 @@ async function _fetchSpotOHLCRaw(sym, tf) {
   // 4) MEXC spot (Binance uyumlu API — memecoinlerin çoğu burada listeli, geo-engel yok)
   try {
     const iv = _spotTf.binance[tf] || '5m';
-    const r = await fetch(`https://api.mexc.com/api/v3/klines?symbol=${sym}USDT&interval=${iv}&limit=200`);
+    const r = await fetch(`https://api.mexc.com/api/v3/klines?symbol=${sym}USDT&interval=${iv}&limit=${L(1000)}`);
     const d = await r.json();
     if (Array.isArray(d) && d.length >= 10) {
       _lastSpotSource = 'MEXC Spot';
@@ -315,13 +318,13 @@ async function _fetchSpotOHLCRaw(sym, tf) {
     if (d.code === '200000' && Array.isArray(d.data) && d.data.length >= 10) {
       _lastSpotSource = 'KuCoin Spot';
       // KuCoin: [time(s), open, close, high, low, volume, turnover] — en yeni önce
-      return d.data.reverse().map(k => ({ t:+k[0]*1000, o:+k[1], h:+k[3], l:+k[4], c:+k[2], vol:+k[5] })).slice(-200);
+      return d.data.reverse().map(k => ({ t:+k[0]*1000, o:+k[1], h:+k[3], l:+k[4], c:+k[2], vol:+k[5] })).slice(-limit);
     }
   } catch (e) {}
   // 6) Gate.io spot
   try {
     const gTf = { '1m':'1m','5m':'5m','15m':'15m','1h':'1h','4h':'4h','1d':'1d','1w':'7d' }[tf] || '5m';
-    const r = await fetch(`https://api.gateio.ws/api/v4/spot/candlesticks?currency_pair=${sym}_USDT&interval=${gTf}&limit=200`);
+    const r = await fetch(`https://api.gateio.ws/api/v4/spot/candlesticks?currency_pair=${sym}_USDT&interval=${gTf}&limit=${L(1000)}`);
     const d = await r.json();
     if (Array.isArray(d) && d.length >= 10) {
       _lastSpotSource = 'Gate.io Spot';
@@ -583,8 +586,10 @@ function pivotLevels(bars, price) {
 // HODL / UZUN VADE SPOT ALIM PLANI — günlük+haftalık dip analizi + kademeli alım (%'li)
 // ================================================================
 async function dcaPlan(sym) {
-  const d1 = await fetchSpotOHLC(sym, '1d');
-  const w1 = await fetchSpotOHLC(sym, '1w');
+  sym = String(sym).toUpperCase().replace(/USDT$/, '');   // taban sembole normalize (çift-USDT bug'ı önlenir)
+  // TÜM GEÇMİŞ: günlük ~1000 mum (≈3 yıl), haftalık ~500 mum (≈10 yıl) — uzun vade analizi tam veriyle
+  const d1 = await fetchSpotOHLC(sym, '1d', 1000);
+  const w1 = await fetchSpotOHLC(sym, '1w', 500);
   if (!d1 || d1.length < 60) return null;
   const price = d1[d1.length - 1].c;
   const cD = d1.map(b => b.c);
@@ -592,15 +597,17 @@ async function dcaPlan(sym) {
   const rsiW = w1 && w1.length > 20 ? (a => a[a.length - 1] || 50)(rsiArr(w1.map(b => b.c), 14)) : null;
   const tdD = tdSeq(d1), tdW = w1 ? tdSeq(w1) : null;
   const e50 = ema(cD, 50), e200 = cD.length >= 200 ? ema(cD, 200) : null;
-  // 52 hafta zirve/dip
+  // 52 hafta + TÜM ZAMANLAR zirve/dip (mevcut tüm geçmişten)
   const yr = d1.slice(-365);
   const hi52 = Math.max(...yr.map(b => b.h)), lo52 = Math.min(...yr.map(b => b.l));
+  const allBars = (w1 && w1.length > 30) ? w1 : d1;
+  const hiAll = Math.max(...allBars.map(b => b.h)), loAll = Math.min(...allBars.map(b => b.l));
   // Hacim: son 20 gün ort. vs önceki 20 gün (düşüşte hacim azalıyorsa satıcı yorgunluğu)
   const v20 = d1.slice(-20).reduce((s, b) => s + b.vol, 0) / 20;
   const vPrev = d1.slice(-40, -20).reduce((s, b) => s + b.vol, 0) / 20;
   const satisYorgun = price < e50 && v20 < vPrev * 0.8;
-  // Destekler: günlük pivotlar + haftalık ana destek
-  const pd = pivotLevels(d1.slice(-200), price);
+  // Destekler: GENİŞ günlük geçmiş (500 mum) + haftalık TÜM geçmiş pivotları
+  const pd = pivotLevels(d1.slice(-500), price);
   const pw = w1 && w1.length > 30 ? pivotLevels(w1, price) : { sup: [], res: [] };
   let sups = pd.sup.slice(0, 4).map(x => x.p);
   const wMajor = pw.sup.length ? pw.sup[0].p : null;
@@ -637,7 +644,7 @@ async function dcaPlan(sym) {
   const durum = dipSkor >= 5 ? '🟢 ALIM BÖLGESİ — kademeli girişe uygun'
              : dipSkor >= 3 ? '🟡 YAKLAŞIYOR — ilk kademeye hazırlan, teyit bekle'
              : '⚪ BEKLE — dip sinyalleri henüz zayıf, seviyeler aşağıda';
-  return { price, rsiD, rsiW, tdD, tdW, hi52, lo52, dipSkor, dipNot, durum, ladder, rezerv, hedefs, wMajor, altOnay, sups };
+  return { price, rsiD, rsiW, tdD, tdW, hi52, lo52, hiAll, loAll, dipSkor, dipNot, durum, ladder, rezerv, hedefs, wMajor, altOnay, sups };
 }
 function hodlMessage(sym, plan, sup) {
   const dec = plan.price > 100 ? 2 : plan.price > 1 ? 4 : 6;
@@ -652,9 +659,11 @@ function hodlMessage(sym, plan, sup) {
   }
   const zirvedenPct = ((plan.price - plan.hi52) / plan.hi52 * 100).toFixed(0);
   const diptenPct = ((plan.price - plan.lo52) / plan.lo52 * 100).toFixed(0);
+  const athLine = (plan.hiAll && plan.hiAll > plan.hi52 * 1.02)
+    ? `📜 Tüm zamanlar (mevcut geçmiş): zirve ${f(plan.hiAll)} (%${((plan.price - plan.hiAll) / plan.hiAll * 100).toFixed(0)}) · dip ${f(plan.loAll)}\n` : '';
   let msg = `🏦 <b>${sym} — UZUN VADE SPOT ALIM PLANI (HODL)</b>\n\n` +
     `🏗️ Proje kalitesi: ${kalite}\n` +
-    `💰 Fiyat: <b>${f(plan.price)}</b> · 52h zirveden %${zirvedenPct} · dipten +%${diptenPct}\n\n` +
+    `💰 Fiyat: <b>${f(plan.price)}</b> · 52h zirveden %${zirvedenPct} · dipten +%${diptenPct}\n` + athLine + `\n` +
     `<b>📅 Dip Analizi (skor ${plan.dipSkor.toFixed(1)}/10):</b>\n` +
     (plan.dipNot.length ? plan.dipNot.map(n => '• ' + n).join('\n') : '• Belirgin dip sinyali yok') + '\n\n' +
     `🎯 <b>DURUM: ${plan.durum}</b>\n\n` +
@@ -1457,7 +1466,7 @@ async function fetchBybitRaw(fullSym, tf) {
 }
 async function fetchOKXRaw(fullSym, tf) {
   const bar = { '1m':'1m','3m':'3m','5m':'5m','15m':'15m','30m':'30m','1h':'1H','2h':'2H','4h':'4H','1d':'1D','1w':'1W' }[tf] || '5m';
-  const url = `https://www.okx.com/api/v5/market/candles?instId=${fullSym}&bar=${bar}&limit=200`;
+  const url = `https://www.okx.com/api/v5/market/candles?instId=${fullSym}&bar=${bar}&limit=${L(300)}`;
   try {
     const r = await fetch(url);
     if (!r.ok) return null;
@@ -1502,7 +1511,7 @@ async function fetchBybit(sym, tf) {
 // ── OKX kline ──
 async function fetchOKX(sym, tf) {
   const bar = { '1m':'1m','3m':'3m','5m':'5m','15m':'15m','30m':'30m','1h':'1H','2h':'2H','4h':'4H','1d':'1D','1w':'1W' }[tf] || '5m';
-  const url = `https://www.okx.com/api/v5/market/candles?instId=${sym}-USDT-SWAP&bar=${bar}&limit=200`;
+  const url = `https://www.okx.com/api/v5/market/candles?instId=${sym}-USDT-SWAP&bar=${bar}&limit=${L(300)}`;
   try {
     const r = await fetch(url);
     if (!r.ok) return null;
@@ -1747,7 +1756,7 @@ async function scanSpotWatchlist() {
       const f = v => v.toLocaleString('tr-TR', { minimumFractionDigits: dec, maximumFractionDigits: dec });
       const msgOf = async (pfx) => {
         // UZUN VADE HODL FORMATI: günlük/haftalık dip analizi + kademeli alım planı (%'li)
-        const plan = await dcaPlan(sym + 'USDT').catch(() => null) || await dcaPlan(sym).catch(() => null);
+        const plan = await dcaPlan(sym).catch(() => null);
         const supInfo = await getSupplyInfo(sym).catch(() => null);
         let head = `🟢🛒 <b>${pfx} — ${sym}</b> <i>(kaldıraçsız spot)</i>\n` +
           `⏱️ Tetikleyen kurulum: <b>${bestTf}</b> grafiği${best.maNote ? ' · ' + best.maNote : ''} · güven %${sig.confidence}\n\n`;
@@ -2563,7 +2572,7 @@ async function pollCommands() {
         // ── "COIN spot" → UZUN VADE HODL/DCA ANALİZİ (günlük+haftalık dip + kademeli alım planı) ──
         const symU = coinSym.toUpperCase().replace('USDT', '');
         await sendTelegramTo(chatId, `⏳ <b>${symU}</b> uzun vade SPOT analizi yapılıyor (günlük/haftalık dip + kademeli alım planı)...`);
-        const plan = await dcaPlan(symU + 'USDT');
+        const plan = await dcaPlan(symU);
         if (!plan) { await sendTelegramTo(chatId, `❌ <b>${symU}</b> için yeterli günlük spot verisi bulunamadı.`); continue; }
         const supInfo = await getSupplyInfo(symU).catch(() => null);
         await sendTelegramTo(chatId, hodlMessage(symU, plan, supInfo));
