@@ -1466,7 +1466,7 @@ async function fetchBybitRaw(fullSym, tf) {
 }
 async function fetchOKXRaw(fullSym, tf) {
   const bar = { '1m':'1m','3m':'3m','5m':'5m','15m':'15m','30m':'30m','1h':'1H','2h':'2H','4h':'4H','1d':'1D','1w':'1W' }[tf] || '5m';
-  const url = `https://www.okx.com/api/v5/market/candles?instId=${fullSym}&bar=${bar}&limit=${L(300)}`;
+  const url = `https://www.okx.com/api/v5/market/candles?instId=${fullSym}&bar=${bar}&limit=300`;
   try {
     const r = await fetch(url);
     if (!r.ok) return null;
@@ -1511,7 +1511,7 @@ async function fetchBybit(sym, tf) {
 // ── OKX kline ──
 async function fetchOKX(sym, tf) {
   const bar = { '1m':'1m','3m':'3m','5m':'5m','15m':'15m','30m':'30m','1h':'1H','2h':'2H','4h':'4H','1d':'1D','1w':'1W' }[tf] || '5m';
-  const url = `https://www.okx.com/api/v5/market/candles?instId=${sym}-USDT-SWAP&bar=${bar}&limit=${L(300)}`;
+  const url = `https://www.okx.com/api/v5/market/candles?instId=${sym}-USDT-SWAP&bar=${bar}&limit=300`;
   try {
     const r = await fetch(url);
     if (!r.ok) return null;
@@ -1755,17 +1755,29 @@ async function scanSpotWatchlist() {
       const dec = price > 100 ? 2 : price > 1 ? 4 : 6;
       const f = v => v.toLocaleString('tr-TR', { minimumFractionDigits: dec, maximumFractionDigits: dec });
       const msgOf = async (pfx) => {
-        // UZUN VADE HODL FORMATI: günlük/haftalık dip analizi + kademeli alım planı (%'li)
-        const plan = await dcaPlan(sym).catch(() => null);
+        // TUTARLILIK: bot İÇERİDE lv seviyelerini (TP1-3/SL) takip eder → mesaj da AYNI seviyeleri gösterir.
+        // (Önceki hata: mesaj HODL planı gösterip TP bildirimleri gizli scalp seviyelerinden geliyordu.)
         const supInfo = await getSupplyInfo(sym).catch(() => null);
-        let head = `🟢🛒 <b>${pfx} — ${sym}</b> <i>(kaldıraçsız spot)</i>\n` +
-          `⏱️ Tetikleyen kurulum: <b>${bestTf}</b> grafiği${best.maNote ? ' · ' + best.maNote : ''} · güven %${sig.confidence}\n\n`;
-        if (plan) return head + hodlMessage(sym, plan, supInfo);
-        // Plan kurulamazsa (kısa geçmişli coin) klasik format
-        return head +
+        let plan = null; try { plan = await dcaPlan(sym); } catch (e) {}
+        let m = `🟢🛒 <b>${pfx} — ${sym}</b> <i>(kaldıraçsız spot · KISA VADELİ)</i>\n` +
+          `⏱️ Tetikleyen kurulum: <b>${bestTf}</b> grafiği${best.maNote ? ' · ' + best.maNote : ''} · güven %${sig.confidence}\n\n` +
           `<b>📍 Alım bölgesi:</b> $${f(lv.entryZoneLow)} — $${f(lv.entryZoneHigh)}\n` +
-          `▫️ İdeal alım: $${f(lv.entry)}\n🎯 Sat: TP1 $${f(lv.tp1)} · TP2 $${f(lv.tp2)} · TP3 $${f(lv.tp3)}\n` +
-          `🛑 Zarar durdur: $${f(lv.sl)}\n\n⚠️ <i>Yatırım tavsiyesi değildir.</i>`;
+          `▫️ Giriş: $${f(lv.entry)}\n` +
+          `🎯 <b>Takip edilen sat hedefleri:</b>\nTP1 $${f(lv.tp1)} · TP2 $${f(lv.tp2)} · TP3 $${f(lv.tp3)}\n` +
+          `🛑 Zarar durdur (sat): $${f(lv.sl)}\n` +
+          `<i>Sonraki TP/zarar bildirimleri TAM bu seviyelerden gelir.</i>\n\n`;
+        if (plan && plan.dipSkor >= 3) {
+          // Uzun vade dip sinyalleri DE güçlü → tam HODL planını ekle
+          m += '━━━━━━━━━━━\n' + hodlMessage(sym, plan, supInfo);
+          return m;
+        }
+        if (plan) {
+          m += `🏦 <b>Uzun vade notu:</b> dip skoru ${plan.dipSkor.toFixed(1)}/10 — HODL alım bölgesi HENÜZ DEĞİL` +
+            (plan.ladder[0] ? ` (ilk HODL kademesi $${f(plan.ladder[0].price)})` : '') +
+            `. Bu sinyal kısa vadeli spot işlemdir; tam HODL planı için "<code>${sym} spot</code>" yaz.\n\n`;
+        }
+        m += `⚠️ <i>Yatırım tavsiyesi değildir.</i>`;
+        return m;
       };
       if (lv.inZone) {
         // Fiyat ZATEN alım seviyesinde → sinyali ŞİMDİ ver
@@ -1848,14 +1860,14 @@ async function monitorSpotPositions() {
       } else {
         if (high >= pos.tp3 && !pos.tpHit.includes(3)) {
           pos.tpHit.push(3);
-          await sendTelegram(`🎯🎯🎯 <b>SATIŞ SİNYALİ — ${sym} TP3</b>\n\nFiyat: $${f(pos.tp3)}\nKâr: ~%${((pos.tp3 - pos.entry) / pos.entry * 100).toFixed(1)}\n\n✅ Tüm hedefler tamam — kalanı sat.`);
+          await sendTelegram(`🎯🎯🎯 <b>SATIŞ SİNYALİ — ${sym} TP3</b>\n\nGiriş: $${f(pos.entry)} → Fiyat: $${f(pos.tp3)}\nKâr: ~%${((pos.tp3 - pos.entry) / pos.entry * 100).toFixed(1)}\n\n✅ Tüm hedefler tamam — kalanı sat.`);
           close = true; result = 'win';
         } else if (high >= pos.tp2 && !pos.tpHit.includes(2)) {
           pos.tpHit.push(2);
-          await sendTelegram(`🎯🎯 <b>SATIŞ SİNYALİ — ${sym} TP2</b>\n\nFiyat: $${f(pos.tp2)}\nKâr: ~%${((pos.tp2 - pos.entry) / pos.entry * 100).toFixed(1)}\n\n💡 Bir kısmını sat, zarar durdur girişe.`);
+          await sendTelegram(`🎯🎯 <b>SATIŞ SİNYALİ — ${sym} TP2</b>\n\nGiriş: $${f(pos.entry)} → Fiyat: $${f(pos.tp2)}\nKalan hedef: TP3 $${f(pos.tp3)}\nKâr: ~%${((pos.tp2 - pos.entry) / pos.entry * 100).toFixed(1)}\n\n💡 Bir kısmını sat, zarar durdur girişe.`);
         } else if (high >= pos.tp1 && !pos.tpHit.includes(1)) {
           pos.tpHit.push(1);
-          await sendTelegram(`🎯 <b>SATIŞ SİNYALİ — ${sym} TP1</b>\n\nFiyat: $${f(pos.tp1)}\nKâr: ~%${((pos.tp1 - pos.entry) / pos.entry * 100).toFixed(1)}\n\n💡 Kârın bir kısmını sat.`);
+          await sendTelegram(`🎯 <b>SATIŞ SİNYALİ — ${sym} TP1</b>\n\nGiriş: $${f(pos.entry)} → Fiyat: $${f(pos.tp1)}\nKâr: ~%${((pos.tp1 - pos.entry) / pos.entry * 100).toFixed(1)}\nKalan hedefler: TP2 $${f(pos.tp2)} · TP3 $${f(pos.tp3)}\n\n💡 Kârın bir kısmını sat.`);
         }
         // Aşırı alım uyarısı (RSI çok yüksek) — kâr aldıysan sat
         if (!close && pos.filled && !pos.warnedRsi) {
