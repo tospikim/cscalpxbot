@@ -220,6 +220,41 @@ const spotPositions = {};
 let _lastSpotSource = '';   // son başarılı spot veri kaynağı (mesajlarda gösterilir)
 const _spotCache = {};      // kısa önbellek: {key: {t, v, src}} — DEX rate limitini korur (GT: ~30 istek/dk)
 
+// ── 🏛️ GELENEKSEL PİYASALAR (yüksek hacimli) — Yahoo Finance, key gerekmez ──
+// Kripto dışı grafiklerde de analiz + sinyal: altın, gümüş, endeksler, büyük hisseler.
+const TRAD_MAP = {
+  GOLD: 'GC=F', ALTIN: 'GC=F', XAU: 'GC=F',
+  SILVER: 'SI=F', GUMUS: 'SI=F', XAG: 'SI=F',
+  SPX: '^GSPC', SP500: '^GSPC', NASDAQ: '^IXIC', NDX: '^NDX', DOW: '^DJI', DXY: 'DX-Y.NYB',
+  NVDA: 'NVDA', AAPL: 'AAPL', TSLA: 'TSLA', MSFT: 'MSFT', GOOGL: 'GOOGL', AMZN: 'AMZN', META: 'META', MSTR: 'MSTR', COIN: 'COIN',
+};
+// Otomatik taranacak geleneksel semboller (env ile değiştirilebilir: TRAD_SYMBOLS=GOLD,NVDA)
+const TRAD_SYMBOLS = (clean(process.env.TRAD_SYMBOLS) || 'GOLD,SILVER,SPX,NVDA')
+  .split(',').map(s => s.trim().toUpperCase()).filter(s => TRAD_MAP[s]);
+const _yTf = { '5m': ['5m', '5d'], '15m': ['15m', '1mo'], '1h': ['60m', '3mo'], '4h': ['60m', '3mo'], '1d': ['1d', '2y'], '1w': ['1wk', '10y'] };
+async function fetchYahooOHLC(ySym, tf) {
+  try {
+    const [iv, range] = _yTf[tf] || ['60m', '3mo'];
+    const r = await fetch(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ySym)}?interval=${iv}&range=${range}`, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+    const d = await r.json();
+    const res = d && d.chart && d.chart.result && d.chart.result[0];
+    if (!res || !res.timestamp) return null;
+    const q = res.indicators.quote[0];
+    let bars = res.timestamp.map((t, i) => ({ t: t * 1000, o: q.open[i], h: q.high[i], l: q.low[i], c: q.close[i], vol: q.volume[i] || 0 }))
+      .filter(b => b.o != null && b.c != null && b.h != null && b.l != null);
+    // 4h Yahoo'da yok → 60m'den 4'lü birleştir
+    if (tf === '4h' && bars.length > 8) {
+      const agg = [];
+      for (let i = 0; i < bars.length; i += 4) {
+        const g = bars.slice(i, i + 4); if (g.length < 2) continue;
+        agg.push({ t: g[0].t, o: g[0].o, h: Math.max(...g.map(x => x.h)), l: Math.min(...g.map(x => x.l)), c: g[g.length - 1].c, vol: g.reduce((s, x) => s + x.vol, 0) });
+      }
+      bars = agg;
+    }
+    return bars;
+  } catch (e) { return null; }
+}
+
 // ── MEXC SPOT PAZARINI OTOMATİK TARA (vadeli tarayıcı gibi) ──
 // Tüm MEXC spot coinlerini hacim+hareket ile filtreler, en sıcakları döner.
 // Vadelide (OKX/Binance/Bybit) zaten izlenen coinler ATLANIR (çift sinyal olmasın) —
@@ -270,6 +305,12 @@ async function fetchSpotOHLC(sym, tf, limit) {
 async function _fetchSpotOHLCRaw(sym, tf, limit) {
   limit = limit || 200;
   const L = (max) => Math.min(limit, max);
+  // 0) 🏛️ GELENEKSEL PİYASA (altın/gümüş/endeks/hisse) — Yahoo Finance (key gerekmez)
+  if (TRAD_MAP[sym]) {
+    const b = await fetchYahooOHLC(TRAD_MAP[sym], tf);
+    if (b && b.length >= 10) { _lastSpotSource = 'Yahoo (' + sym + ' 🏛️)'; return b.slice(-limit); }
+    return null;   // geleneksel sembol kripto borsalarında aranmaz
+  }
   // 1) OKX spot
   try {
     const bar = _spotTf.okx[tf] || '5m';
@@ -406,11 +447,22 @@ function emaSeries(vals, p) {
   for (let i = 0; i < vals.length; i++) { e = i ? vals[i] * k + e * (1 - k) : vals[0]; out.push(e); }
   return out;
 }
+// SMA SERİSİ (klasik Golden/Death Cross tanımı SMA ile yapılır)
+function smaSeries(vals, p) {
+  const out = []; let sum = 0;
+  for (let i = 0; i < vals.length; i++) {
+    sum += vals[i]; if (i >= p) sum -= vals[i - p];
+    out.push(i >= p - 1 ? sum / p : vals[i]);
+  }
+  return out;
+}
 // GOLDEN / DEATH CROSS + kısa MA kesişimleri (son 12 mum içinde)
-function detectMACross(bars, fast, slow) {
+// useSma=true → klasik SMA tanımı; varsayılan EMA (daha erken tetiklenir)
+function detectMACross(bars, fast, slow, useSma) {
   if (!bars || bars.length < slow + 5) return null;
   const c = bars.map(b => b.c);
-  const f = emaSeries(c, fast), s = emaSeries(c, slow);
+  const fn = useSma ? smaSeries : emaSeries;
+  const f = fn(c, fast), s = fn(c, slow);
   for (let i = c.length - 1; i >= Math.max(slow, c.length - 12); i--) {
     if (f[i - 1] <= s[i - 1] && f[i] > s[i]) return { type: 'golden', barsAgo: c.length - 1 - i };
     if (f[i - 1] >= s[i - 1] && f[i] < s[i]) return { type: 'death', barsAgo: c.length - 1 - i };
@@ -420,10 +472,11 @@ function detectMACross(bars, fast, slow) {
 // ── KESİŞİM YAKLAŞIYOR tespiti — MA'lar birbirine yakınsıyor, kesişim henüz olmadı ──
 // Kesişim fiyatlanmadan ÖNCE erken sinyal verir. golden_soon: hızlı MA alttan yaklaşıyor
 // (yakında golden cross → LONG fırsatı), death_soon: üstten yaklaşıyor (SHORT fırsatı).
-function detectMAConvergence(bars, fast, slow) {
+function detectMAConvergence(bars, fast, slow, useSma) {
   if (!bars || bars.length < slow + 8) return null;
   const c = bars.map(b => b.c);
-  const f = emaSeries(c, fast), s = emaSeries(c, slow);
+  const fn = useSma ? smaSeries : emaSeries;
+  const f = fn(c, fast), s = fn(c, slow);
   const n = c.length - 1;
   const gap = (i) => (f[i] - s[i]) / s[i] * 100;           // % fark (işaretli)
   const gNow = gap(n), gPrev = gap(n - 3);                  // 3 mum önceki fark
@@ -472,11 +525,24 @@ async function maCrossWatcher() {
         const conv = cross ? null : detectMAConvergence(bars, 50, 200);
         const ev = cross ? { k: cross.type, txt: cross.type === 'golden' ? `🌟 <b>GOLDEN CROSS — ${sym} (${ad})</b>\nEMA50, EMA200'ü YUKARI kesti (${cross.barsAgo} mum önce). Orta/uzun vade yükseliş dönüşü — LONG tarafı güçlendi.` : `💀 <b>DEATH CROSS — ${sym} (${ad})</b>\nEMA50, EMA200'ü AŞAĞI kesti (${cross.barsAgo} mum önce). Düşüş dönüşü — SHORT tarafı güçlendi.` }
           : conv ? { k: conv.type, txt: conv.type === 'golden_soon' ? `⏳🌟 <b>GOLDEN CROSS YAKLAŞIYOR — ${sym} (${ad})</b>\nEMA50 alttan EMA200'e yaklaşıyor (fark %${conv.gapPct.toFixed(2)}, ~${conv.etaBars} mum). Kesişim fiyatlanmadan ERKEN LONG fırsatı olabilir.` : `⏳💀 <b>DEATH CROSS YAKLAŞIYOR — ${sym} (${ad})</b>\nEMA50 üstten EMA200'e yaklaşıyor (fark %${conv.gapPct.toFixed(2)}, ~${conv.etaBars} mum). Erken SHORT fırsatı olabilir.` } : null;
-        if (!ev) continue;
-        const key = `${sym}_${tf}_${ev.k}`;
-        if (_maAlerted[key] && Date.now() - _maAlerted[key] < 12 * 3600 * 1000) continue;
-        _maAlerted[key] = Date.now();
-        await sendTelegram(ev.txt + '\n\n<i>Yatırım tavsiyesi değildir.</i>');
+        if (ev) {
+          const key = `${sym}_${tf}_${ev.k}`;
+          if (!(_maAlerted[key] && Date.now() - _maAlerted[key] < 12 * 3600 * 1000)) {
+            _maAlerted[key] = Date.now();
+            await sendTelegram(ev.txt + '\n\n<i>Yatırım tavsiyesi değildir.</i>');
+            await new Promise(r => setTimeout(r, 600));
+          }
+        }
+        // ── KLASİK (SMA 50×200) kesişim — TradingView'in standart Golden/Death Cross tanımı ──
+        const sCross = detectMACross(bars, 50, 200, true);
+        const sConv = sCross ? null : detectMAConvergence(bars, 50, 200, true);
+        const sEv = sCross ? { k: 'sma_' + sCross.type, txt: sCross.type === 'golden' ? `🌟📐 <b>KLASİK GOLDEN CROSS — ${sym} (${ad})</b>\nSMA50, SMA200'ü YUKARI kesti (${sCross.barsAgo} mum önce) — TradingView standart tanımı.` : `💀📐 <b>KLASİK DEATH CROSS — ${sym} (${ad})</b>\nSMA50, SMA200'ü AŞAĞI kesti (${sCross.barsAgo} mum önce) — TradingView standart tanımı.` }
+          : sConv ? { k: 'sma_' + sConv.type, txt: sConv.type === 'golden_soon' ? `⏳🌟📐 <b>KLASİK GOLDEN CROSS YAKLAŞIYOR — ${sym} (${ad})</b>\nSMA50 alttan SMA200'e yaklaşıyor (fark %${sConv.gapPct.toFixed(2)}, ~${sConv.etaBars} mum).` : `⏳💀📐 <b>KLASİK DEATH CROSS YAKLAŞIYOR — ${sym} (${ad})</b>\nSMA50 üstten SMA200'e yaklaşıyor (fark %${sConv.gapPct.toFixed(2)}, ~${sConv.etaBars} mum).` } : null;
+        if (!sEv) continue;
+        const sKey = `${sym}_${tf}_${sEv.k}`;
+        if (_maAlerted[sKey] && Date.now() - _maAlerted[sKey] < 12 * 3600 * 1000) continue;
+        _maAlerted[sKey] = Date.now();
+        await sendTelegram(sEv.txt + '\n\n<i>Yatırım tavsiyesi değildir.</i>');
         await new Promise(r => setTimeout(r, 600));
       }
     }
