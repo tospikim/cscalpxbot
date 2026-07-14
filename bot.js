@@ -99,7 +99,7 @@ function isCounterTrend(dir, htf) {
 function recordOutcome(ctx, result, extra) {
   if (!ctx) return;
   learnLog.push({ sym: ctx.sym, dir: ctx.dir, htf: ctx.htf, ct: ctx.ct ? 1 : 0, conf: ctx.conf, dist: ctx.dist,
-    spot: ctx.spot ? 1 : 0, tp: (extra && extra.tp) || 0, result, t: Date.now() });
+    spot: ctx.spot ? 1 : 0, major: ctx.major ? 1 : 0, trad: ctx.trad ? 1 : 0, tp: (extra && extra.tp) || 0, result, t: Date.now() });
   if (learnLog.length > 2000) learnLog = learnLog.slice(-2000);
   saveLearning();
   console.log(`🧠 Sonuç kaydedildi: ${ctx.sym} ${ctx.dir} → ${result} (toplam ${learnLog.length})`);
@@ -176,6 +176,9 @@ function tradeStats() {
   const wr = total ? Math.round(wins.length / total * 100) : 0;
   const fut = learnLog.filter(e => !e.spot), spt = learnLog.filter(e => e.spot);
   const fw = fut.filter(e => e.result === 'win').length, sw = spt.filter(e => e.result === 'win').length;
+  // 💎 Majör vs altcoin vs 🏛️ geleneksel — hangi grup daha az SL oluyor? (bot değişikliği kararı için)
+  const grup = (arr) => { const w = arr.filter(e => e.result === 'win').length; return { n: arr.length, w, wr: arr.length ? Math.round(w / arr.length * 100) : 0 }; };
+  const gMaj = grup(learnLog.filter(e => e.major)), gAlt = grup(learnLog.filter(e => !e.major && !e.trad)), gTrad = grup(learnLog.filter(e => e.trad));
   const tp3 = wins.filter(e => e.tp >= 3).length, tp2 = wins.filter(e => e.tp === 2).length, tp1 = wins.filter(e => e.tp === 1).length;
   // Son 24 saat
   const day = learnLog.filter(e => Date.now() - e.t < 24 * 3600 * 1000);
@@ -196,6 +199,10 @@ function tradeStats() {
     (wins.length ? `TP dağılımı: TP1 ${tp1} · TP2 ${tp2} · TP3 ${tp3}\n` : '') +
     `\n<b>Vadeli:</b> ${fut.length} işlem (${fw}✅/${fut.length - fw}🛑${fut.length ? ' · %' + Math.round(fw / fut.length * 100) : ''})\n` +
     `<b>Spot:</b> ${spt.length} işlem (${sw}✅/${spt.length - sw}🛑${spt.length ? ' · %' + Math.round(sw / spt.length * 100) : ''})\n` +
+    `\n<b>Hacim grubu karşılaştırması</b> (top-coin geçişi kararı için):\n` +
+    `💎 Majör: ${gMaj.n} işlem · %${gMaj.wr} başarı\n` +
+    `🪙 Altcoin: ${gAlt.n} işlem · %${gAlt.wr} başarı\n` +
+    `🏛️ Geleneksel: ${gTrad.n} işlem · %${gTrad.wr} başarı\n` +
     `\n<b>Son 24 saat:</b> ${day.length} işlem (${dw}✅/${day.length - dw}🛑)\n` +
     `\n<b>Şu an:</b> ${openF} vadeli + ${openS} spot pozisyon açık · ${pend} kurulum bekliyor\n` +
     (son ? `\n<b>Son kapananlar:</b>\n${son}` : '') +
@@ -1754,14 +1761,14 @@ async function scanSpotWatchlist() {
     if (rot.length < 40) rot = rot.concat(all.slice(0, 40 - rot.length));
     _spotRotIdx = (_spotRotIdx + 40) % all.length;
   }
-  const list = [...new Set([...SPOT_COINS, ...autoList, ...rot])];
+  const list = [...new Set([...SPOT_COINS, ...TRAD_SYMBOLS, ...autoList, ...rot])];
   if (!list.length) return;
-  console.log(new Date().toLocaleTimeString('tr-TR'), `- 🛒 Spot tarama: ${SPOT_COINS.length} manuel + ${autoList.length} sıcak + ${rot.length} dönüşümlü (toplam evren ${all.length}) = ${list.length} coin`);
+  console.log(new Date().toLocaleTimeString('tr-TR'), `- 🛒 Spot tarama: ${SPOT_COINS.length} manuel + ${TRAD_SYMBOLS.length} 🏛️ geleneksel + ${autoList.length} sıcak + ${rot.length} dönüşümlü (evren ${all.length}) = ${list.length}`);
   for (const sym of list) {
     try {
       if (spotPositions[sym]) continue;                 // zaten alımdayız
       if (pendingSpotSetups[sym]) continue;             // kurulum zaten bekleniyor
-      const manual = SPOT_COINS.includes(sym);
+      const manual = SPOT_COINS.includes(sym) || TRAD_SYMBOLS.includes(sym);
       // Otomatik coinlerde HIZLI ÖN FİLTRE (15m) — ancak umut varsa tam çoklu-TF taraması yap
       if (!manual) {
         const qb = await fetchSpotOHLC(sym, '15m');
@@ -1798,6 +1805,12 @@ async function scanSpotWatchlist() {
         if (cross && cross.type === 'golden') { score += 10; maNote = `🌟 Golden Cross (${tf})`; }
         if (conv && conv.type === 'golden_soon') { score += 6; maNote = `⏳🌟 Golden Cross yaklaşıyor (${tf}, ~${conv.etaBars} mum)`; }
         if (cross && cross.type === 'death') score -= 12;   // death cross'lu TF'de alma
+        // TD9 (DeMark): dip sayımı alımı güçlendirir, tepe sayımı düşürür
+        const tdS = tdSeq(bars);
+        if (tdS && tdS.last && tdS.last.barsAgo <= 3) {
+          if (tdS.last.type === 'buy9')  { score += 7; if (!maNote) maNote = `🔢 TD9 DİP (${tf})`; }
+          if (tdS.last.type === 'sell9') score -= 9;
+        }
         if (!best || score > best.score) best = { tf, bars, price, sig, score, maNote };
       }
       if (!best) continue;
@@ -1813,7 +1826,7 @@ async function scanSpotWatchlist() {
 
       // Öğrenme kapısı (spot üst-TF trendiyle) — kötü alımı ele
       const htf = await spotHtfBias(sym).catch(() => null);
-      const ctxL = { sym, dir: 'LONG', htf: htfBucket(htf), ct: isCounterTrend('LONG', htf), conf: sig.confidence, dist: lv.distToZone || 0, spot: true };
+      const ctxL = { sym, dir: 'LONG', htf: htfBucket(htf), ct: isCounterTrend('LONG', htf), conf: sig.confidence, dist: lv.distToZone || 0, spot: true, trad: TRAD_MAP[sym] ? 1 : 0 };
       const blocked = learnBlock(ctxL);
       if (blocked) { console.log(`   🧠 spot ${sym} ALIM atlandı: ${blocked}`); continue; }
 
@@ -1826,6 +1839,7 @@ async function scanSpotWatchlist() {
         const supInfo = await getSupplyInfo(sym).catch(() => null);
         let plan = null; try { plan = await dcaPlan(sym); } catch (e) {}
         let m = `🟢🛒 <b>${pfx} — ${sym}</b> <i>(kaldıraçsız spot · KISA VADELİ)</i>\n` +
+          (TRAD_MAP[sym] ? `🏛️ <b>YÜKSEK HACİMLİ GELENEKSEL VARLIK</b> (${TRAD_MAP[sym]}) — büyük hacimli grafik, analiz güvenilirliği testi\n` : '') +
           `⏱️ Tetikleyen kurulum: <b>${bestTf}</b> grafiği${best.maNote ? ' · ' + best.maNote : ''} · güven %${sig.confidence}\n\n` +
           `<b>📍 Alım bölgesi:</b> $${f(lv.entryZoneLow)} — $${f(lv.entryZoneHigh)}\n` +
           `▫️ Giriş: $${f(lv.entry)}\n` +
@@ -1953,12 +1967,14 @@ async function scanForSignals() {
     return;
   }
 
-  // Hacim + hareket olan coinleri scalp skoruna göre sırala, en iyi N tanesini detaylı tara
-  const candidates = coins
-    .sort((a, b) => b.scalpScore - a.scalpScore)
-    .slice(0, CONFIG.scanMaxDetailed);
+  // ── 💎 MAJÖR ÖNCELİĞİ: en yüksek hacimli top coinler HER taramada önce ve garantili ──
+  // (Kullanıcı stratejisi: büyük hacimli grafiklerde tahmin isabeti daha yüksek → önce bunlar)
+  const MAJORS = new Set(['BTC','ETH','SOL','BNB','XRP','ADA','DOGE','AVAX','LINK','TON','TRX','DOT','LTC','BCH','NEAR','UNI','APT','ARB','OP','SUI']);
+  const majorCoins = coins.filter(c => MAJORS.has(c.sym));
+  const otherCoins = coins.filter(c => !MAJORS.has(c.sym)).sort((a, b) => b.scalpScore - a.scalpScore);
+  const candidates = [...majorCoins, ...otherCoins].slice(0, Math.max(CONFIG.scanMaxDetailed, majorCoins.length + 40));
 
-  console.log(new Date().toLocaleTimeString('tr-TR'), `- ${coins.length} coin hacim filtresinden geçti, ${candidates.length} tanesi detaylı taranıyor...`);
+  console.log(new Date().toLocaleTimeString('tr-TR'), `- ${coins.length} coin hacim filtresinden geçti: 💎 ${majorCoins.length} majör öncelikli + ${candidates.length - majorCoins.length} altcoin taranıyor...`);
   let found = 0;
   // Teşhis sayaçları - neden sinyal verilmediğini görmek için
   let noData = 0, lowConf = 0, deduped = 0, btFail = 0, scanned = 0, unreachable = 0, hasOpen = 0, learnSkip = 0;
@@ -2025,12 +2041,30 @@ async function scanForSignals() {
       // ── GİRİŞ MESAFESİ: giriş bölgesi çok uzaksa güvenilmez (panel: >%1 ele) ──
       if (!lv.inZone && lv.distToZone > 0.8) { unreachable++; continue; }
 
+      // ── TD9 (DeMark) + GOLDEN/DEATH CROSS — sinyal önemine katılır (panelle aynı) ──
+      const _td = tdSeq(bars);
+      if (_td && _td.last && _td.last.barsAgo <= 3) {
+        if (sig.dir === 'LONG'  && _td.last.type === 'buy9')  { sig.confidence = Math.min(97, sig.confidence + 6); sig.signals.unshift('🔢 TD9 DİP teyidi (' + _td.last.barsAgo + ' mum)'); }
+        if (sig.dir === 'SHORT' && _td.last.type === 'sell9') { sig.confidence = Math.min(97, sig.confidence + 6); sig.signals.unshift('🔢 TD9 TEPE teyidi (' + _td.last.barsAgo + ' mum)'); }
+        if (sig.dir === 'LONG'  && _td.last.type === 'sell9') { lowConf++; continue; }   // tepe sayımına karşı long açma
+        if (sig.dir === 'SHORT' && _td.last.type === 'buy9')  { lowConf++; continue; }
+      }
+      const _gc = detectMACross(bars, 50, 200);
+      if (_gc) {
+        if (sig.dir === 'LONG'  && _gc.type === 'golden') { sig.confidence = Math.min(97, sig.confidence + 5); sig.signals.unshift('🌟 Golden Cross teyidi (' + CONFIG.scalpTF + ')'); }
+        if (sig.dir === 'SHORT' && _gc.type === 'death')  { sig.confidence = Math.min(97, sig.confidence + 5); sig.signals.unshift('💀 Death Cross teyidi (' + CONFIG.scalpTF + ')'); }
+        if (sig.dir === 'LONG'  && _gc.type === 'death')  { lowConf++; continue; }       // death cross'a karşı long açma
+        if (sig.dir === 'SHORT' && _gc.type === 'golden') { lowConf++; continue; }
+      }
+
       // ── ÖĞRENME KAPISI: daha az SL için trend/geçmiş filtreleri ──
       const htf = await getMultiTFBias(coin.sym).catch(() => null);
       const ctxL = {
         sym: coin.sym, dir: sig.dir, htf: htfBucket(htf),
         ct: isCounterTrend(sig.dir, htf), conf: sig.confidence, dist: lv.distToZone || 0,
+        major: MAJORS.has(coin.sym) ? 1 : 0,
       };
+      if (MAJORS.has(coin.sym)) sig.signals.unshift('💎 Yüksek hacimli majör coin');
       const blocked = learnBlock(ctxL);
       if (blocked) { learnSkip++; console.log(`   🧠 ${coin.sym} ${sig.dir} atlandı: ${blocked}`); continue; }
 
